@@ -1,4 +1,4 @@
-Claude
+
 Bot · PY
 """
 JoinGate Bot - 2 channel join-request approval bot
