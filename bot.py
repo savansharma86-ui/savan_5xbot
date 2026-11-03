@@ -1,22 +1,24 @@
 """
-JoinGate Bot - 2 channel join-request approval bot
-aiogram 3.x + SQLite (aiosqlite)
+JoinGate Bot v3 - 2 channel join-request approval bot
+aiogram 3.13+ / aiosqlite / long polling
+
+Note: the Bot API cannot approve requests that arrived before the bot was running.
 """
 import asyncio
+import json
 import logging
 import os
+import re
 import time
+from contextlib import suppress
 from html import escape
 
 import aiosqlite
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.middlewares.base import BaseRequestMiddleware
 from aiogram.enums import ChatMemberStatus, ParseMode
-from aiogram.exceptions import (
-    TelegramAPIError,
-    TelegramBadRequest,
-    TelegramRetryAfter,
-)
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -27,6 +29,7 @@ from aiogram.types import (
     ChatJoinRequest,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    LinkPreviewOptions,
     Message,
 )
 from dotenv import load_dotenv
@@ -40,78 +43,153 @@ DB_PATH = os.getenv("DB_PATH", "joingate.db")
 
 router = Router()
 db: aiosqlite.Connection = None  # type: ignore
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 # ----------------------------------------------------------------------------
-# Default texts (English + Hindi). Bot owner can edit /start and /help from bot.
+# Small-caps style: "Savan" -> "Sᴀᴠᴀɴ" for EVERY outgoing message and button.
+# Set STYLE=0 in .env to turn it off.
 # ----------------------------------------------------------------------------
-DEFAULT_START = (
-    "👋 <b>Welcome to JoinGate / JoinGate में आपका स्वागत है</b>\n\n"
-    "Handle your channel's join requests with a smart 2-channel flow.\n"
-    "2-चैनल सिस्टम से अपने चैनल की join requests आसानी से संभालें।\n\n"
-    "<b>What it does / यह क्या करता है</b>\n"
-    "• Messages every new requester automatically / हर नए requester को अपने-आप मैसेज\n"
-    "• Sends them a gate-channel link / उन्हें गेट-चैनल का लिंक भेजता है\n"
-    "• Approves one by one or all at once / एक-एक करके या सब एक साथ approve\n\n"
-    "⚙️ /settings — Setup / सेटअप\n"
-    "📖 /help — Step-by-step guide / गाइड\n\n"
-    "💯 100% free for everyone / सबके लिए पूरी तरह फ्री"
+STYLE_ON = os.getenv("STYLE", "1") != "0"
+_SC = dict(zip("abcdefghijklmnopqrstuvwxyz", "ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘǫʀꜱᴛᴜᴠᴡxʏᴢ"))
+# parts that must stay untouched: <code>..</code>, html tags, entities, links, @names, /commands, {placeholders}
+_SKIP = re.compile(
+    r"(<code>.*?</code>|<[^>]+>|&[a-zA-Z#0-9]+;|https?://\S+|\bt\.me/\S+|@\w+|(?<![\w/])/[A-Za-z_]+|\{[^}]*\})",
+    re.S,
+)
+_WORD = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
+
+
+def _sc_word(m):
+    w = m.group(0)
+    return w[0].upper() + "".join(_SC.get(ch, ch) for ch in w[1:].lower())
+
+
+def style(text):
+    if not STYLE_ON or not text:
+        return text
+    out = []
+    for i, part in enumerate(_SKIP.split(text)):
+        out.append(part if i % 2 else _WORD.sub(_sc_word, part))
+    return "".join(out)
+
+
+class StyleMiddleware(BaseRequestMiddleware):
+    """Applies the small-caps style to the text, caption and buttons of every outgoing request."""
+
+    async def __call__(self, make_request, bot, method):
+        for attr in ("text", "caption"):
+            v = getattr(method, attr, None)
+            if isinstance(v, str):
+                setattr(method, attr, style(v))
+        rm = getattr(method, "reply_markup", None)
+        if isinstance(rm, InlineKeyboardMarkup):
+            rows = [[b.model_copy(update={"text": style(b.text)}) for b in row] for row in rm.inline_keyboard]
+            method.reply_markup = InlineKeyboardMarkup(inline_keyboard=rows)
+        return await make_request(bot, method)
+
+
+# ----------------------------------------------------------------------------
+# Text helpers: every point lives in its own box, English + Hinglish
+# ----------------------------------------------------------------------------
+def box(title, en, hi=None):
+    s = f"<blockquote><b>{title}</b>\n{en}"
+    if hi:
+        s += f"\n<i>{hi}</i>"
+    return s + "</blockquote>"
+
+
+def bi(en, hi):
+    return f"{en}\n<i>{hi}</i>"
+
+
+def sections(*parts):
+    return "\n\n".join(parts)
+
+
+DEFAULT_START = sections(
+    "👋 <b>Welcome to JoinGate</b>",
+    box(
+        "What it does",
+        "Messages everyone who requests to join your channel, and lets you approve requests in one tap.",
+        "Jo bhi aapke channel me join request dalta hai, bot usse turant message karta hai aur aap ek tap me requests approve kar sakte ho.",
+    ),
+    box(
+        "Quick start",
+        "Tap ⚙️ Settings to connect your channel. Tap 📖 Help for the full guide.",
+        "Channel connect karne ke liye ⚙️ Settings dabao. Poori guide ke liye 📖 Help dabao.",
+    ),
+    box("Price", "100% free for everyone.", "Sabke liye bilkul free."),
 )
 
-DEFAULT_HELP = (
-    "📖 <b>JoinGate — Quick Guide / गाइड</b>\n\n"
-    "<b>Step 1 — Add the bot / बॉट जोड़ें</b>\n"
-    "Make this bot <b>admin</b> in your channel(s) with the <i>Invite Users</i> permission.\n"
-    "अपने चैनल में बॉट को <b>admin</b> बनाएँ (Invite Users permission ज़रूरी)।\n\n"
-    "<b>Step 2 — Set Channel A / चैनल A सेट करें</b>\n"
-    "Open /settings → <b>Set/Change A</b>. Send the @username, the channel ID, or forward any post. "
-    "Channel A is the channel people send join requests to.\n"
-    "/settings → Set/Change A. @username, ID भेजें या कोई पोस्ट forward करें। "
-    "Channel A वह चैनल है जिसमें लोग join request भेजते हैं।\n\n"
-    "<b>Step 3 — Set Channel B (optional) / चैनल B (ज़रूरी नहीं)</b>\n"
-    "Channel B is your gate: users get its link and must request it too. "
-    "If you skip B, the bot owner's default link is sent instead and nothing is auto-approved.\n"
-    "Channel B आपका गेट है: users को उसका लिंक मिलता है और उसमें भी request भेजनी होती है। "
-    "B न सेट करें तो बॉट-ओनर का default लिंक जाता है और कुछ भी auto-approve नहीं होता।\n\n"
-    "<b>Step 4 — Choose approve mode / मोड चुनें</b>\n"
-    "When both A and B are set, the bot asks you:\n"
-    "✅ <b>Auto-approve</b> — user requests B → their A request is approved automatically.\n"
-    "🕓 <b>Manual</b> — users only send requests; you approve later.\n"
-    "दोनों चैनल सेट होने पर बॉट पूछेगा: Auto-approve (B में request → A अपने-आप approve) या Manual (आप बाद में approve करें)।\n\n"
-    "<b>Step 5 — Approve requests / Approve करें</b>\n"
-    "• Post <code>/accept_all</code> inside your channel (as admin) → every pending request of that channel is approved.\n"
-    "• Or use /accept_all here in the bot.\n"
-    "अपने चैनल में admin के तौर पर <code>/accept_all</code> भेजें → उस चैनल की सभी pending requests approve हो जाएंगी। "
-    "या यहाँ बॉट में /accept_all इस्तेमाल करें।\n\n"
-    "<b>Step 6 — Customize / बदलाव</b>\n"
-    "Edit your welcome message anytime in /settings. Use <code>{name}</code> for the user's name.\n"
-    "Welcome message /settings में कभी भी बदलें। यूज़र के नाम के लिए <code>{name}</code> लिखें।\n\n"
-    "❓ /cancel — stop the current action / मौजूदा काम रोकें"
+DEFAULT_HELP = sections(
+    "📖 <b>JoinGate Guide</b>",
+    box(
+        "1️⃣ Add the bot as admin",
+        "Add this bot as an admin in your channel with the Invite Users permission.",
+        "Bot ko apne channel me admin banao (Invite Users permission ke saath).",
+    ),
+    box(
+        "2️⃣ Connect Channel A",
+        "Open ⚙️ Settings → Set/Change A. Send the @username, the channel ID, or forward any post from the channel. Channel A is where people send join requests.",
+        "Settings → Set/Change A kholo. @username, channel ID bhejo ya channel ka koi post forward karo. Channel A wo hai jisme log join request dalte hain.",
+    ),
+    box(
+        "3️⃣ Connect Channel B (optional)",
+        "Channel B is your gate. Users get its link and must request it too. If you skip B, the bot owner's default link is sent and nothing is auto-approved.",
+        "Channel B aapka gate hai. Users ko uska link milta hai aur usme bhi request dalni hoti hai. B set nahi kiya to bot owner ka default link jayega aur kuch auto-approve nahi hoga.",
+    ),
+    box(
+        "4️⃣ Choose the approve mode",
+        "When both channels are set, the bot asks you: ✅ Auto-approve (B request → approved in A) or 🕓 Manual (users only send requests, you approve later).",
+        "Dono channel set hone par bot poochega: Auto-approve (B me request → A me approve) ya Manual (users sirf request bhejenge, aap baad me approve karoge).",
+    ),
+    box(
+        "5️⃣ Approve requests",
+        "Post <code>/accept_all</code> inside your channel (as admin) to approve every pending request of that channel. It also works in this bot.",
+        "Apne channel me admin ke roop me <code>/accept_all</code> likho, us channel ki saari pending requests approve ho jayengi. Ye command bot me bhi chalta hai.",
+    ),
+    box(
+        "6️⃣ Welcome message",
+        "Edit it anytime in ⚙️ Settings. Use <code>{name}</code> for the user's name. You can add a photo or video too.",
+        "Settings me kabhi bhi badlo. User ka naam dalne ke liye <code>{name}</code> likho. Photo ya video bhi laga sakte ho.",
+    ),
 )
 
 
 def default_welcome(auto: bool, has_link: bool) -> str:
-    head = (
-        "Hi {name}! 👋\n"
-        "Your join request has been received ✅\n"
-        "आपकी join request मिल गई है।\n\n"
-    )
-    if not has_link:
-        return head + "You will be approved soon.\nजल्द ही आपको approve कर दिया जाएगा।"
-    step = (
-        "Next step: please send a join request to the channel below.\n"
-        "अगला कदम: कृपया नीचे दिए चैनल में भी join request भेजें।\n\n"
-    )
-    if auto:
-        tail = (
-            "As soon as you do, you will be approved automatically.\n"
-            "आपके request भेजते ही आप अपने-आप approve हो जाएंगे।"
-        )
+    if has_link:
+        en = "✅ Your join request has been received.\nFor fast approval, send a join request to the channel below"
+        hi = "Aapki join request mil gayi hai.\nFast approval ke liye neeche wale channel me request bhejo"
+        if auto:
+            en += " and you will be approved right away."
+            hi += " aur aap turant approve ho jaoge."
+        else:
+            en += ". You will be approved shortly."
+            hi += ". Jaldi hi aapko approve kar diya jayega."
     else:
-        tail = (
-            "After that, you will be approved shortly.\n"
-            "इसके बाद जल्द ही आपको approve कर दिया जाएगा।"
-        )
-    return head + step + tail
+        en = "✅ Your join request has been received.\nYou will be approved shortly."
+        hi = "Aapki join request mil gayi hai.\nJaldi hi aapko approve kar diya jayega."
+    return f"👋 <b>Hi {{name}}!</b>\n<blockquote>{en}\n<i>{hi}</i></blockquote>"
+
+
+MODE_TEXT = sections(
+    "🔀 <b>Approve Mode</b>",
+    box(
+        "How it works",
+        "A user requests Channel A and gets your Channel B link. What should happen after they request Channel B?",
+        "User Channel A me request karta hai aur use aapke Channel B ka link milta hai. B me request ke baad kya hona chahiye?",
+    ),
+    box(
+        "✅ Auto-approve",
+        "Their Channel A request is approved automatically.",
+        "Unki A ki request automatically approve ho jayegi.",
+    ),
+    box(
+        "🕓 Manual",
+        "Users only send requests. You approve later by posting <code>/accept_all</code> in your channel.",
+        "Users sirf request bhejenge. Aap baad me channel me <code>/accept_all</code> likhkar approve karoge.",
+    ),
+)
 
 
 # ----------------------------------------------------------------------------
@@ -147,7 +225,7 @@ async def init_db():
         """
     )
     await db.commit()
-    try:  # migration for databases created by the first version
+    try:  # migration for databases created by older versions
         await db.execute("ALTER TABLE owners ADD COLUMN mode_confirmed INTEGER DEFAULT 0")
         await db.commit()
     except Exception:
@@ -191,6 +269,102 @@ async def get_owner(uid):
 
 
 # ----------------------------------------------------------------------------
+# Rich content (text / photo / video / GIF / document) stored as JSON
+# ----------------------------------------------------------------------------
+def extract_content(m: Message):
+    c = m.html_text or ""
+    if m.photo:
+        return {"t": "photo", "f": m.photo[-1].file_id, "c": c}
+    if m.video:
+        return {"t": "video", "f": m.video.file_id, "c": c}
+    if m.animation:
+        return {"t": "animation", "f": m.animation.file_id, "c": c}
+    if m.document:
+        return {"t": "document", "f": m.document.file_id, "c": c}
+    if m.text:
+        return {"t": "text", "c": c}
+    return None
+
+
+def parse_content(raw, legacy_escape=False):
+    """Return a content dict from a stored value (JSON, or legacy plain/HTML text)."""
+    if not raw:
+        return None
+    try:
+        d = json.loads(raw)
+        if isinstance(d, dict) and "t" in d:
+            return d
+    except ValueError:
+        pass
+    return {"t": "text", "c": escape(raw) if legacy_escape else raw}
+
+
+async def get_content(key, default_text):
+    d = parse_content(await get_setting(key, None))
+    return d or {"t": "text", "c": default_text}
+
+
+def content_preview(raw):
+    d = parse_content(raw, legacy_escape=True)
+    if not d:
+        return "Default message"
+    txt = re.sub(r"<[^>]+>", "", d.get("c", "")).strip()
+    tag = "" if d["t"] == "text" else f"[{d['t']}] "
+    return escape(tag + txt[:160])
+
+
+async def send_content(bot: Bot, chat_id, data, markup=None, name=None, preview_url=None):
+    """Send stored content. For text, preview_url shows the channel card (logo + bio) under the text."""
+    t = data.get("t", "text")
+    c = data.get("c") or ""
+    if name is not None:
+        c = c.replace("{name}", escape(name))
+
+    async def _send(parse):
+        if t == "text":
+            lp = (
+                LinkPreviewOptions(url=preview_url, prefer_large_media=True, show_above_text=False)
+                if preview_url
+                else NO_PREVIEW
+            )
+            return await bot.send_message(
+                chat_id, c or "👋", reply_markup=markup, parse_mode=parse, link_preview_options=lp
+            )
+        sender = {
+            "photo": bot.send_photo,
+            "video": bot.send_video,
+            "animation": bot.send_animation,
+            "document": bot.send_document,
+        }[t]
+        cap = c if 0 < len(c) <= 1024 else None
+        msg = await sender(
+            chat_id,
+            data["f"],
+            caption=cap,
+            reply_markup=markup if (cap or not c) else None,
+            parse_mode=parse,
+        )
+        if c and cap is None:
+            await bot.send_message(
+                chat_id, c, reply_markup=markup, parse_mode=parse, link_preview_options=NO_PREVIEW
+            )
+        return msg
+
+    for _ in range(2):
+        try:
+            try:
+                return await _send(ParseMode.HTML)
+            except TelegramBadRequest as e:
+                s = str(e).lower()
+                if "parse" in s or "entit" in s:
+                    return await _send(None)
+                raise
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+    return None
+
+
+# ----------------------------------------------------------------------------
 # UI helpers
 # ----------------------------------------------------------------------------
 def kb(rows):
@@ -200,34 +374,45 @@ def kb(rows):
 
 
 def home_kb(uid):
-    rows = [[("⚙️ Settings", "s:main"), ("📖 Help / गाइड", "help")]]
+    rows = [[("⚙️ Settings", "s:main"), ("📖 Help", "help")]]
     if uid == OWNER_ID:
         rows.append([("👑 Admin Panel", "adm:main")])
     return kb(rows)
 
 
 async def show(msg: Message, text: str, markup=None):
-    """Edit message if possible, else send a new one. Falls back to plain text if HTML is broken."""
+    """Edit the message if possible, otherwise send a new one (plain text if HTML is broken)."""
     try:
-        await msg.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
+        await msg.edit_text(text, reply_markup=markup, link_preview_options=NO_PREVIEW)
     except TelegramBadRequest as e:
         s = str(e).lower()
         if "not modified" in s:
             return
-        if "parse" in s or "entities" in s:
-            await msg.answer(text, reply_markup=markup, parse_mode=None)
-        else:
-            try:
-                await msg.answer(text, reply_markup=markup, disable_web_page_preview=True)
-            except TelegramBadRequest:
-                await msg.answer(text, reply_markup=markup, parse_mode=None)
+        try:
+            if "parse" in s or "entit" in s:
+                await msg.answer(text, reply_markup=markup, parse_mode=None, link_preview_options=NO_PREVIEW)
+            else:
+                await msg.answer(text, reply_markup=markup, link_preview_options=NO_PREVIEW)
+        except TelegramBadRequest:
+            await msg.answer(text, reply_markup=markup, parse_mode=None, link_preview_options=NO_PREVIEW)
 
 
 async def reply(msg: Message, text: str, markup=None):
     try:
-        await msg.answer(text, reply_markup=markup, disable_web_page_preview=True)
+        await msg.answer(text, reply_markup=markup, link_preview_options=NO_PREVIEW)
     except TelegramBadRequest:
-        await msg.answer(text, reply_markup=markup, parse_mode=None)
+        await msg.answer(text, reply_markup=markup, parse_mode=None, link_preview_options=NO_PREVIEW)
+
+
+async def show_content(c: CallbackQuery, bot: Bot, key, default, markup):
+    data = await get_content(key, default)
+    msg = c.message
+    if data.get("t", "text") == "text" and msg.text:
+        await show(msg, data["c"], markup)
+    else:
+        with suppress(TelegramAPIError):
+            await msg.delete()
+        await send_content(bot, msg.chat.id, data, markup)
 
 
 # ----------------------------------------------------------------------------
@@ -267,25 +452,25 @@ class Broadcast(StatesGroup):
 # Commands (registered first so they always win over FSM handlers)
 # ----------------------------------------------------------------------------
 @router.message(CommandStart())
-async def cmd_start(m: Message, state: FSMContext):
+async def cmd_start(m: Message, state: FSMContext, bot: Bot):
     await state.clear()
     await upsert_user(m.from_user)
-    text = await get_setting("start_text", DEFAULT_START)
-    await reply(m, text, home_kb(m.from_user.id))
+    data = await get_content("start_text", DEFAULT_START)
+    await send_content(bot, m.chat.id, data, home_kb(m.from_user.id))
 
 
 @router.message(Command("help"))
-async def cmd_help(m: Message, state: FSMContext):
+async def cmd_help(m: Message, state: FSMContext, bot: Bot):
     await state.clear()
     await upsert_user(m.from_user)
-    text = await get_setting("help_text", DEFAULT_HELP)
-    await reply(m, text, kb([[("🏠 Home", "home")]]))
+    data = await get_content("help_text", DEFAULT_HELP)
+    await send_content(bot, m.chat.id, data, kb([[("🏠 Home", "home")]]))
 
 
 @router.message(Command("cancel"))
 async def cmd_cancel(m: Message, state: FSMContext):
     await state.clear()
-    await m.answer("❌ Cancelled / रद्द किया गया")
+    await m.answer(bi("❌ Cancelled.", "Cancel kar diya gaya."))
 
 
 @router.message(Command("settings"))
@@ -316,7 +501,7 @@ async def cmd_broadcast(m: Message, state: FSMContext):
     if m.from_user.id != OWNER_ID:
         return
     await state.set_state(Broadcast.waiting)
-    await m.answer("📢 Send the message you want to broadcast (text / photo / video / anything).\n/cancel to stop.")
+    await m.answer("📢 Send the message to broadcast (text / photo / video / anything).\n/cancel to stop.")
 
 
 @router.message(Command("ban"))
@@ -327,8 +512,7 @@ async def cmd_ban(m: Message):
     if len(parts) != 2 or not parts[1].isdigit():
         return await m.answer("Usage: /ban USER_ID")
     await run(
-        "INSERT INTO users(user_id,banned,created_at) VALUES(?,1,?) "
-        "ON CONFLICT(user_id) DO UPDATE SET banned=1",
+        "INSERT INTO users(user_id,banned,created_at) VALUES(?,1,?) ON CONFLICT(user_id) DO UPDATE SET banned=1",
         (int(parts[1]), int(time.time())),
     )
     await m.answer(f"🚫 Banned {parts[1]}")
@@ -349,17 +533,15 @@ async def cmd_unban(m: Message):
 # Home / help callbacks
 # ----------------------------------------------------------------------------
 @router.callback_query(F.data == "home")
-async def cb_home(c: CallbackQuery, state: FSMContext):
+async def cb_home(c: CallbackQuery, state: FSMContext, bot: Bot):
     await state.clear()
-    text = await get_setting("start_text", DEFAULT_START)
-    await show(c.message, text, home_kb(c.from_user.id))
+    await show_content(c, bot, "start_text", DEFAULT_START, home_kb(c.from_user.id))
     await c.answer()
 
 
 @router.callback_query(F.data == "help")
-async def cb_help(c: CallbackQuery):
-    text = await get_setting("help_text", DEFAULT_HELP)
-    await show(c.message, text, kb([[("🏠 Home", "home")]]))
+async def cb_help(c: CallbackQuery, bot: Bot):
+    await show_content(c, bot, "help_text", DEFAULT_HELP, kb([[("🏠 Home", "home")]]))
     await c.answer()
 
 
@@ -368,8 +550,8 @@ async def cb_help(c: CallbackQuery):
 # ----------------------------------------------------------------------------
 def ch_line(title, link):
     if not title:
-        return "❌ Not set / सेट नहीं है"
-    return f"{escape(title)}\n{link or ''}"
+        return "❌ Not set"
+    return f"{escape(title)}\n{escape(link or '')}"
 
 
 async def settings_view(uid):
@@ -377,35 +559,31 @@ async def settings_view(uid):
     default_link = await get_setting("default_b_link", "")
     if o["a_id"] and o["b_id"]:
         if o["mode_confirmed"] and o["mode"] == "chain":
-            mode_txt = (
-                "✅ Auto-approve — B request → A approved automatically\n"
-                "    (B में request → A अपने-आप approve)"
-            )
+            mode = ("✅ Auto-approve", "B request → A is approved automatically.", "B me request aate hi A me approve.")
         elif o["mode_confirmed"]:
-            mode_txt = (
-                "🕓 Manual — users only send requests; you approve with /accept_all\n"
-                "    (आप खुद approve करेंगे)"
-            )
+            mode = ("🕓 Manual", "Users only send requests. You approve with /accept_all.", "Users sirf request bhejenge. Aap /accept_all se approve karoge.")
         else:
-            mode_txt = (
-                "⚠️ Not chosen yet — tap “Approve Mode”. Nothing is auto-approved until you confirm.\n"
-                "    (अभी चुना नहीं गया — आपके confirm करने तक auto-approve बंद है)"
-            )
+            mode = ("⚠️ Not chosen yet", "Tap “Approve Mode”. Nothing is auto-approved until you confirm.", "“Approve Mode” dabao. Aapke confirm karne tak kuch auto-approve nahi hoga.")
     elif o["a_id"]:
-        mode_txt = "🕓 Manual — Channel B is not set, so nothing is auto-approved.\n    (B सेट नहीं है, auto-approve बंद है)"
+        en = "Channel B is not set, so nothing is auto-approved."
+        hi = "Channel B set nahi hai, isliye kuch auto-approve nahi hoga."
         if default_link:
-            mode_txt += "\nℹ️ Requesters will get the bot owner's default gate link.\n    (Requesters को बॉट-ओनर का default लिंक मिलेगा)"
+            en += " Requesters get the bot owner's default link."
+            hi += " Requesters ko bot owner ka default link milega."
+        mode = ("🕓 Manual", en, hi)
     else:
-        mode_txt = "—"
-    welcome = o["welcome"] or "(default)"
-    text = (
-        "⚙️ <b>Your Settings / आपकी सेटिंग्स</b>\n\n"
-        f"📢 <b>Channel A (main):</b>\n{ch_line(o['a_title'], o['a_link'])}\n\n"
-        f"📣 <b>Channel B (gate, optional):</b>\n{ch_line(o['b_title'], o['b_link'])}\n\n"
-        f"🔀 <b>Approve mode:</b>\n{mode_txt}\n\n"
-        f"💬 <b>Welcome message:</b>\n{escape(welcome[:300])}\n\n"
-        "💡 Post <code>/accept_all</code> in your channel to approve all pending requests.\n"
-        "चैनल में <code>/accept_all</code> भेजकर सभी pending requests approve करें।"
+        mode = ("—", "Set Channel A first.", "Pehle Channel A set karo.")
+    text = sections(
+        "⚙️ <b>Your Settings</b>",
+        box("📢 Channel A (main)", ch_line(o["a_title"], o["a_link"])),
+        box("📣 Channel B (gate, optional)", ch_line(o["b_title"], o["b_link"])),
+        box(f"🔀 Approve mode: {mode[0]}", mode[1], mode[2]),
+        box("💬 Welcome message", content_preview(o["welcome"])),
+        box(
+            "✅ Approve requests",
+            "Post <code>/accept_all</code> in your channel to approve all pending requests.",
+            "Channel me <code>/accept_all</code> likho, saari pending requests approve ho jayengi.",
+        ),
     )
     markup = kb(
         [
@@ -425,19 +603,6 @@ async def cb_settings(c: CallbackQuery, state: FSMContext):
     text, markup = await settings_view(c.from_user.id)
     await show(c.message, text, markup)
     await c.answer()
-
-
-MODE_TEXT = (
-    "🔀 <b>Approve Mode / अप्रूव मोड</b>\n\n"
-    "When someone requests Channel A, the bot sends them your Channel B link.\n"
-    "What should happen after they request Channel B?\n"
-    "जब कोई Channel A में request करता है, बॉट उसे Channel B का लिंक भेजता है। B में request के बाद क्या हो?\n\n"
-    "✅ <b>Auto-approve</b> — their Channel A request is approved automatically.\n"
-    "    उनकी A की request अपने-आप approve हो जाएगी।\n\n"
-    "🕓 <b>Manual</b> — users only send requests; you approve later by posting "
-    "<code>/accept_all</code> in your channel.\n"
-    "    यूज़र सिर्फ request भेजेंगे; आप बाद में चैनल में <code>/accept_all</code> भेजकर approve करें।"
-)
 
 
 def mode_kb():
@@ -461,7 +626,7 @@ async def cb_mode_set(c: CallbackQuery):
     o = await get_owner(c.from_user.id)
     new = c.data.split(":")[1]
     if new == "chain" and not (o["a_id"] and o["b_id"]):
-        return await c.answer("Set both Channel A and B first / पहले A और B दोनों सेट करें", show_alert=True)
+        return await c.answer("Set both Channel A and B first.", show_alert=True)
     await run("UPDATE owners SET mode=?, mode_confirmed=1 WHERE user_id=?", (new, c.from_user.id))
     text, markup = await settings_view(c.from_user.id)
     await show(c.message, text, markup)
@@ -474,11 +639,20 @@ async def cb_set_channel(c: CallbackQuery, state: FSMContext):
     await state.set_state(SetChannel.waiting)
     await state.update_data(which=which)
     await c.message.answer(
-        f"📢 Send <b>Channel {which.upper()}</b> now:\n"
-        "• its @username, or\n• its ID (like -100123...), or\n• forward any post from that channel\n\n"
-        "⚠️ Bot must be <b>admin</b> there (Invite Users permission) and you must be admin too.\n"
-        "Channel को @username / ID भेजें या कोई पोस्ट forward करें। बॉट और आप दोनों admin होने चाहिए।\n\n"
-        "/cancel to stop."
+        sections(
+            f"📢 <b>Send Channel {which.upper()}</b>",
+            box(
+                "How to send",
+                "Send its @username, its ID (like -100123...), or forward any post from it.",
+                "Uska @username, ID (jaise -100123...) bhejo ya uska koi post forward karo.",
+            ),
+            box(
+                "Required",
+                "The bot must be admin there (Invite Users) and you must be admin too.",
+                "Bot wahan admin hona chahiye (Invite Users) aur aap bhi admin hone chahiye.",
+            ),
+            "/cancel to stop.",
+        )
     )
     await c.answer()
 
@@ -489,7 +663,7 @@ async def cb_new_link(c: CallbackQuery, bot: Bot):
     o = await get_owner(c.from_user.id)
     chat_id = o[f"{which}_id"]
     if not chat_id:
-        return await c.answer("Set the channel first / पहले चैनल सेट करें", show_alert=True)
+        return await c.answer("Set the channel first.", show_alert=True)
     try:
         link = await bot.create_chat_invite_link(chat_id, name="JoinGate", creates_join_request=True)
     except TelegramAPIError as e:
@@ -504,23 +678,42 @@ async def cb_new_link(c: CallbackQuery, bot: Bot):
 async def cb_welcome(c: CallbackQuery, state: FSMContext):
     await state.set_state(EditWelcome.waiting)
     await c.message.answer(
-        "✏️ Send your new welcome message (this is DM'd to users when they request Channel A).\n"
-        "Use <code>{name}</code> for the user's name. Send <code>default</code> to reset.\n\n"
-        "नया welcome message भेजें। यूज़र का नाम डालने के लिए <code>{name}</code> लिखें। Reset के लिए <code>default</code> भेजें।\n"
-        "/cancel to stop."
+        sections(
+            "✏️ <b>Edit welcome message</b>",
+            box(
+                "What to send",
+                "Send your new welcome message. Text, photo, video or GIF (with caption) all work. Use <code>{name}</code> for the user's name.",
+                "Naya welcome message bhejo. Text, photo, video ya GIF (caption ke saath) sab chalega. User ka naam dalne ke liye <code>{name}</code> likho.",
+            ),
+            box(
+                "Reset",
+                "Send <code>default</code> to go back to the default message.",
+                "Default par wapas jaane ke liye <code>default</code> bhejo.",
+            ),
+            box(
+                "Channel card",
+                "With a text welcome, the bot adds your Channel B card (logo + bio) automatically.",
+                "Text welcome ke saath bot Channel B ka card (logo + bio) khud laga deta hai.",
+            ),
+            "/cancel to stop.",
+        )
     )
     await c.answer()
 
 
-@router.message(EditWelcome.waiting, F.text)
+@router.message(EditWelcome.waiting)
 async def got_welcome(m: Message, state: FSMContext):
-    txt = m.text.strip()
-    val = None if txt.lower() == "default" else txt[:1000]
     await get_owner(m.from_user.id)
-    await run("UPDATE owners SET welcome=? WHERE user_id=?", (val, m.from_user.id))
+    if m.text and m.text.strip().lower() == "default":
+        await run("UPDATE owners SET welcome=NULL WHERE user_id=?", (m.from_user.id,))
+    else:
+        data = extract_content(m)
+        if not data:
+            return await m.answer(bi("❌ Send text, photo, video or GIF.", "Text, photo, video ya GIF bhejo."))
+        await run("UPDATE owners SET welcome=? WHERE user_id=?", (json.dumps(data), m.from_user.id))
     await state.clear()
     text, markup = await settings_view(m.from_user.id)
-    await m.answer("✅ Welcome message updated / अपडेट हो गया")
+    await m.answer(bi("✅ Welcome message updated.", "Welcome message update ho gaya."))
     await reply(m, text, markup)
 
 
@@ -543,25 +736,27 @@ async def got_channel(m: Message, state: FSMContext, bot: Bot):
             chat = await bot.get_chat(ident)
     except TelegramAPIError:
         return await m.answer(
-            "❌ Channel not found. Send @username, numeric ID, or forward a post. Bot must be added as admin.\n"
-            "Channel नहीं मिला। @username, ID भेजें या पोस्ट forward करें।"
+            bi(
+                "❌ Channel not found. Send @username, numeric ID, or forward a post. The bot must be admin there.",
+                "Channel nahi mila. @username, ID bhejo ya post forward karo. Bot wahan admin hona chahiye.",
+            )
         )
 
     if chat.type not in ("channel", "supergroup", "group"):
-        return await m.answer("❌ This is not a channel/group. / यह चैनल नहीं है।")
+        return await m.answer(bi("❌ This is not a channel or group.", "Ye channel ya group nahi hai."))
 
-    # bot must be admin with invite rights
     try:
         me = await bot.get_chat_member(chat.id, bot.id)
     except TelegramAPIError:
-        return await m.answer("❌ Add the bot as admin in that channel first. / पहले बॉट को admin बनाएँ।")
+        return await m.answer(bi("❌ Add the bot as admin there first.", "Pehle bot ko wahan admin banao."))
     if me.status != ChatMemberStatus.ADMINISTRATOR or not getattr(me, "can_invite_users", False):
         return await m.answer(
-            "❌ Bot needs <b>admin</b> with <b>Invite Users</b> permission there.\n"
-            "बॉट को Invite Users permission के साथ admin बनाएँ।"
+            bi(
+                "❌ The bot needs admin rights with the Invite Users permission.",
+                "Bot ko Invite Users permission ke saath admin banao.",
+            )
         )
 
-    # user must be admin of that channel (security)
     try:
         um = await bot.get_chat_member(chat.id, m.from_user.id)
     except TelegramAPIError:
@@ -569,20 +764,19 @@ async def got_channel(m: Message, state: FSMContext, bot: Bot):
     if m.from_user.id != OWNER_ID and (
         um is None or um.status not in (ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR)
     ):
-        return await m.answer("❌ You must be admin of that channel. / आप उस चैनल के admin नहीं हैं।")
+        return await m.answer(bi("❌ You must be an admin of that channel.", "Aap us channel ke admin nahi ho."))
 
-    # channel already used by someone else?
     used = await one(
         "SELECT user_id FROM owners WHERE (a_id=? OR b_id=?) AND user_id!=?",
         (chat.id, chat.id, m.from_user.id),
     )
     if used:
-        return await m.answer("❌ This channel is already linked to another owner. / यह चैनल पहले से किसी और से जुड़ा है।")
+        return await m.answer(bi("❌ This channel is already linked to another owner.", "Ye channel pehle se kisi aur owner se juda hai."))
 
     o = await get_owner(m.from_user.id)
     other = "b" if which == "a" else "a"
     if o[f"{other}_id"] == chat.id:
-        return await m.answer("❌ Channel A and B must be different. / A और B अलग होने चाहिए।")
+        return await m.answer(bi("❌ Channel A and B must be different.", "Channel A aur B alag hone chahiye."))
 
     try:
         link = await bot.create_chat_invite_link(chat.id, name="JoinGate", creates_join_request=True)
@@ -595,12 +789,14 @@ async def got_channel(m: Message, state: FSMContext, bot: Bot):
     )
     await state.clear()
     text, markup = await settings_view(m.from_user.id)
-    await m.answer(f"✅ Channel {which.upper()} set! / सेट हो गया!")
+    await m.answer(bi(f"✅ Channel {which.upper()} saved.", f"Channel {which.upper()} save ho gaya."))
     await reply(m, text, markup)
     o = await get_owner(m.from_user.id)
     if o["a_id"] and o["b_id"] and not o["mode_confirmed"]:
         await m.answer(
-            "❓ <b>Both channels are set. Please confirm / दोनों चैनल सेट हैं, कृपया confirm करें</b>\n\n" + MODE_TEXT,
+            bi("❓ <b>Both channels are set. Please confirm below.</b>", "Dono channel set hain. Neeche confirm karo.")
+            + "\n\n"
+            + MODE_TEXT,
             reply_markup=mode_kb(),
         )
 
@@ -608,19 +804,19 @@ async def got_channel(m: Message, state: FSMContext, bot: Bot):
 @router.callback_query(F.data == "s:stats")
 async def cb_stats(c: CallbackQuery):
     o = await get_owner(c.from_user.id)
-    lines = ["📊 <b>Your Stats / आपके आँकड़े</b>\n"]
+    parts = ["📊 <b>Your Stats</b>"]
     for w in ("a", "b"):
         if o[f"{w}_id"]:
             r = await one(
                 "SELECT COUNT(*) t, SUM(status='approved') a, SUM(status='pending') p FROM requests WHERE chat_id=?",
                 (o[f"{w}_id"],),
             )
-            lines.append(
-                f"<b>Channel {w.upper()}:</b> total {r['t'] or 0} | ✅ {r['a'] or 0} | ⏳ {r['p'] or 0}"
+            parts.append(
+                box(f"Channel {w.upper()}", f"Total: {r['t'] or 0}\n✅ Approved: {r['a'] or 0}\n⏳ Pending: {r['p'] or 0}")
             )
-    if len(lines) == 1:
-        lines.append("No channels set yet. / अभी कोई चैनल सेट नहीं है।")
-    await show(c.message, "\n".join(lines), kb([[("⬅️ Back", "s:main")]]))
+    if len(parts) == 1:
+        parts.append(box("No data", "No channels set yet.", "Abhi koi channel set nahi hai."))
+    await show(c.message, sections(*parts), kb([[("⬅️ Back", "s:main")]]))
     await c.answer()
 
 
@@ -630,13 +826,11 @@ async def cb_stats(c: CallbackQuery):
 async def approve_all_view(uid):
     o = await get_owner(uid)
     if not o["a_id"] and not o["b_id"]:
-        return "❌ Set your channels first in /settings. / पहले /settings में चैनल सेट करें।", None
+        return bi("❌ Set your channels first in /settings.", "Pehle /settings me channel set karo."), None
     counts = {}
     for w in ("a", "b"):
         if o[f"{w}_id"]:
-            r = await one(
-                "SELECT COUNT(*) n FROM requests WHERE chat_id=? AND status='pending'", (o[f"{w}_id"],)
-            )
+            r = await one("SELECT COUNT(*) n FROM requests WHERE chat_id=? AND status='pending'", (o[f"{w}_id"],))
             counts[w] = r["n"]
     rows = []
     if "a" in counts:
@@ -646,10 +840,13 @@ async def approve_all_view(uid):
     if len(counts) == 2:
         rows.append([("✅ Approve Both", "aa:both")])
     rows.append([("❌ Close", "home")])
-    text = (
-        "✅ <b>Approve all pending requests / सभी pending requests approve करें</b>\n\n"
-        "Only requests received while the bot was running are counted.\n"
-        "सिर्फ वही requests गिनी जाती हैं जो बॉट चालू रहते आई थीं।"
+    text = sections(
+        "✅ <b>Accept all pending requests</b>",
+        box(
+            "Note",
+            "Only requests received while the bot was running are counted.",
+            "Sirf wahi requests ginti me aati hain jo bot chalu hone par aayi thi.",
+        ),
     )
     return text, kb(rows)
 
@@ -688,7 +885,8 @@ async def run_approve_all(bot: Bot, chat_ids, notify_id):
         ok += good
         fail += not good
         await asyncio.sleep(0.1)
-    await bot.send_message(notify_id, f"✅ Done / पूरा हुआ\nApproved: {ok}\nFailed (left/expired): {fail}")
+    with suppress(TelegramAPIError):
+        await bot.send_message(notify_id, f"✅ Done.\nApproved: {ok}\nFailed (left or expired): {fail}")
 
 
 @router.callback_query(F.data.startswith("aa:"))
@@ -703,14 +901,25 @@ async def cb_approve_run(c: CallbackQuery, bot: Bot):
     if not ids:
         return await c.answer("Nothing to approve", show_alert=True)
     asyncio.create_task(run_approve_all(bot, ids, c.from_user.id))
-    await show(c.message, "⏳ Approving... I'll message you when done.\nApprove हो रहा है, पूरा होने पर बताऊँगा।",
-               kb([[("🏠 Home", "home")]]))
+    await show(
+        c.message,
+        bi("⏳ Approving... I will message you when done.", "Approve ho raha hai, pura hone par bata dunga."),
+        kb([[("🏠 Home", "home")]]),
+    )
     await c.answer()
 
 
 # ----------------------------------------------------------------------------
-# Join request handler (the core flow)
+# Join requests (the core flow) - the DM goes out FIRST, before any database work
 # ----------------------------------------------------------------------------
+async def record_request(chat_id, user, owner_id):
+    await upsert_user(user)
+    await run(
+        "INSERT OR REPLACE INTO requests(chat_id,user_id,owner_id,status,created_at) VALUES(?,?,?,'pending',?)",
+        (chat_id, user.id, owner_id, int(time.time())),
+    )
+
+
 @router.chat_join_request()
 async def on_join_request(req: ChatJoinRequest, bot: Bot):
     chat_id = req.chat.id
@@ -718,35 +927,40 @@ async def on_join_request(req: ChatJoinRequest, bot: Bot):
     o = await one("SELECT * FROM owners WHERE a_id=? OR b_id=?", (chat_id, chat_id))
     if not o:
         return
-    await upsert_user(user)
-    await run(
-        "INSERT OR REPLACE INTO requests(chat_id,user_id,owner_id,status,created_at) VALUES(?,?,?,'pending',?)",
-        (chat_id, user.id, o["user_id"], int(time.time())),
-    )
+    target = req.user_chat_id or user.id
 
     if o["a_id"] == chat_id:
-        # Request came to Channel A -> DM welcome + gate link
         # gate link = owner's own Channel B, otherwise the bot owner's default link
-        gate_link = o["b_link"] if o["b_id"] else None
-        if not gate_link:
-            gate_link = (await get_setting("default_b_link", "")) or None
+        gate_link = (o["b_link"] if o["b_id"] else None) or (await get_setting("default_b_link", "")) or None
         auto = bool(o["b_id"] and o["mode"] == "chain" and o["mode_confirmed"])
-        text = (o["welcome"] or default_welcome(auto, bool(gate_link))).replace(
-            "{name}", user.first_name or "friend"
-        )
+        data = parse_content(o["welcome"], legacy_escape=True) or {
+            "t": "text",
+            "c": default_welcome(auto, bool(gate_link)),
+        }
         markup = None
         if gate_link:
-            text += f"\n\n🔗 {gate_link}"
             markup = InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="📣 Send request / Request भेजें", url=gate_link)]]
+                inline_keyboard=[[InlineKeyboardButton(text="📣 Open channel & send request", url=gate_link)]]
             )
-        try:
-            await bot.send_message(req.user_chat_id, text, reply_markup=markup, parse_mode=None)
-        except TelegramAPIError as e:
-            logging.warning("DM failed for %s: %s", user.id, e)
+        # Telegram lets the bot DM a requester via user_chat_id even if they never started the bot
+        sent = False
+        for dest in dict.fromkeys([target, user.id]):
+            try:
+                await send_content(
+                    bot, dest, data, markup, name=user.first_name or "friend", preview_url=gate_link
+                )
+                sent = True
+                logging.info("DM sent to %s for request in chat %s", user.id, chat_id)
+                break
+            except TelegramAPIError as e:
+                logging.warning("DM to %s (via %s) failed: %s", user.id, dest, e)
+        if not sent:
+            logging.warning("Could not DM user %s. Is the bot admin with Invite Users in chat %s?", user.id, chat_id)
+        await record_request(chat_id, user, o["user_id"])
         return
 
-    # Request came to Channel B (owner's own gate channel)
+    # request came to the owner's own Channel B
+    await record_request(chat_id, user, o["user_id"])
     if o["mode"] == "chain" and o["mode_confirmed"] and o["a_id"]:
         pending_a = await one(
             "SELECT 1 FROM requests WHERE chat_id=? AND user_id=? AND status='pending'",
@@ -759,38 +973,31 @@ async def on_join_request(req: ChatJoinRequest, bot: Bot):
                 ("approved" if good else "failed", o["a_id"], user.id),
             )
             if good:
-                try:
+                with suppress(TelegramAPIError):
                     await bot.send_message(
-                        req.user_chat_id,
-                        "🎉 You're approved in the main channel! / आप main channel में approve हो गए हैं!",
-                        parse_mode=None,
+                        target,
+                        "🎉 <b>You are approved!</b>\n<i>Aap approve ho gaye ho.</i>",
                     )
-                except TelegramAPIError:
-                    pass
 
 
 @router.channel_post(F.text)
 async def on_channel_post(m: Message, bot: Bot):
-    """Channel admins post /accept_all inside their channel -> approve all pending requests of that channel."""
+    """A channel admin posts /accept_all inside the channel -> approve all pending requests of that channel."""
     cmd = m.text.strip().split()[0].lower().split("@")[0]
     if cmd not in ("/accept_all", "/approve_all"):
         return
     o = await one("SELECT * FROM owners WHERE a_id=? OR b_id=?", (m.chat.id, m.chat.id))
     if not o:
         return
-    try:
+    with suppress(TelegramAPIError):
         await bot.delete_message(m.chat.id, m.message_id)
-    except TelegramAPIError:
-        pass
     n = (await one("SELECT COUNT(*) n FROM requests WHERE chat_id=? AND status='pending'", (m.chat.id,)))["n"]
-    try:
+    with suppress(TelegramAPIError):
         await bot.send_message(
             o["user_id"],
             f"⏳ /accept_all received in <b>{escape(m.chat.title or str(m.chat.id))}</b>.\n"
-            f"Approving {n} pending requests... / {n} pending requests approve हो रही हैं...",
+            f"Approving {n} pending requests...\n<i>{n} pending requests approve ho rahi hain...</i>",
         )
-    except TelegramAPIError:
-        pass
     asyncio.create_task(run_approve_all(bot, [m.chat.id], o["user_id"]))
 
 
@@ -831,11 +1038,11 @@ async def adm_stats(c: CallbackQuery):
     u = await one("SELECT COUNT(*) n, SUM(banned) b FROM users")
     o = await one("SELECT COUNT(*) n FROM owners WHERE a_id IS NOT NULL OR b_id IS NOT NULL")
     r = await one("SELECT COUNT(*) n, SUM(status='approved') a, SUM(status='pending') p FROM requests")
-    text = (
-        "📊 <b>Bot Stats</b>\n\n"
-        f"👤 Users: {u['n']} (banned: {u['b'] or 0})\n"
-        f"👥 Channel owners: {o['n']}\n"
-        f"📩 Requests: {r['n']} | ✅ {r['a'] or 0} | ⏳ {r['p'] or 0}"
+    text = sections(
+        "📊 <b>Bot Stats</b>",
+        box("Users", f"Total: {u['n']}\nBanned: {u['b'] or 0}"),
+        box("Channel owners", f"{o['n']}"),
+        box("Requests", f"Total: {r['n']}\n✅ Approved: {r['a'] or 0}\n⏳ Pending: {r['p'] or 0}"),
     )
     await show(c.message, text, kb([[("⬅️ Back", "adm:main")]]))
     await c.answer()
@@ -848,26 +1055,27 @@ async def adm_owners(c: CallbackQuery):
     rows = await many(
         "SELECT user_id,a_title,b_title,mode FROM owners WHERE a_id IS NOT NULL OR b_id IS NOT NULL LIMIT 50"
     )
-    lines = ["👥 <b>Channel owners</b> (ban with /ban ID)\n"]
+    lines = ["👥 <b>Channel owners</b> (ban with /ban ID)"]
     for r in rows:
         lines.append(
-            f"<code>{r['user_id']}</code> | A: {escape(r['a_title'] or '-')} | B: {escape(r['b_title'] or '-')} | {r['mode']}"
+            box(
+                f"<code>{r['user_id']}</code>",
+                f"A: {escape(r['a_title'] or '-')}\nB: {escape(r['b_title'] or '-')}\nMode: {r['mode']}",
+            )
         )
     if not rows:
         lines.append("No one yet.")
-    await show(c.message, "\n".join(lines), kb([[("⬅️ Back", "adm:main")]]))
+    await show(c.message, sections(*lines), kb([[("⬅️ Back", "adm:main")]]))
     await c.answer()
 
 
 EDIT_PROMPTS = {
-    "start": "✏️ Send the new <b>/start</b> message. Formatting (bold/italic/links) works. Send <code>default</code> to reset.",
-    "help": "✏️ Send the new <b>/help</b> guide. Formatting works. Send <code>default</code> to reset.",
-    "defb": "🎯 Send your channel link (https://t.me/yourchannel or @yourchannel). "
-            "It is sent to requesters whenever a channel owner has NOT set their own Channel B "
-            "(no auto-approve in that case). Send <code>off</code> to disable.",
+    "start": "✏️ Send the new <b>/start</b> message. Text, photo, video or GIF (with caption) all work, with formatting. Send <code>default</code> to reset.",
+    "help": "✏️ Send the new <b>/help</b> guide. Text, photo, video or GIF (with caption) all work, with formatting. Send <code>default</code> to reset.",
+    "defb": "🎯 Send your channel link (https://t.me/yourchannel or @yourchannel). It is sent to requesters when a channel owner has NOT set their own Channel B (no auto-approve then). Send <code>off</code> to disable.",
     "name": "🤖 Send the new bot <b>name</b> (max 64 chars).",
-    "desc": "📝 Send the new bot <b>description</b> (shown on empty chat, max 512 chars).",
-    "about": "💬 Send the new bot <b>about</b> text (shown on profile, max 120 chars).",
+    "desc": "📝 Send the new bot <b>description</b> (max 512 chars).",
+    "about": "💬 Send the new bot <b>about</b> text (max 120 chars).",
 }
 
 
@@ -881,44 +1089,48 @@ async def adm_edit(c: CallbackQuery, state: FSMContext):
     extra = ""
     if key == "defb":
         cur = await get_setting("default_b_link", "")
-        extra = f"\n\nCurrent: {cur or 'not set'}"
+        extra = f"\n\nCurrent: {escape(cur) if cur else 'not set'}"
     await c.message.answer(EDIT_PROMPTS[key] + extra + "\n/cancel to stop.")
     await c.answer()
 
 
-@router.message(AdminEdit.waiting, F.text)
+@router.message(AdminEdit.waiting)
 async def adm_edit_got(m: Message, state: FSMContext, bot: Bot):
     if m.from_user.id != OWNER_ID:
         return
     key = (await state.get_data()).get("key")
-    plain = m.text.strip()
     try:
         if key in ("start", "help"):
             k = f"{key}_text"
-            if plain.lower() == "default":
+            if m.text and m.text.strip().lower() == "default":
                 await run("DELETE FROM settings WHERE key=?", (k,))
             else:
-                await run("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (k, m.html_text))
-        elif key == "defb":
-            if plain.lower() in ("off", "none", "default"):
-                await run("DELETE FROM settings WHERE key='default_b_link'")
-            else:
-                link = plain
-                if link.startswith("@"):
-                    link = "https://t.me/" + link[1:]
-                elif link.startswith("t.me/"):
-                    link = "https://" + link
-                if not link.startswith("https://t.me/"):
-                    return await m.answer(
-                        "❌ Send a valid link like https://t.me/yourchannel or @yourchannel (or <code>off</code>)."
-                    )
-                await run("INSERT OR REPLACE INTO settings(key,value) VALUES('default_b_link',?)", (link,))
-        elif key == "name":
-            await bot.set_my_name(name=plain[:64])
-        elif key == "desc":
-            await bot.set_my_description(description=plain[:512])
-        elif key == "about":
-            await bot.set_my_short_description(short_description=plain[:120])
+                data = extract_content(m)
+                if not data:
+                    return await m.answer("❌ Send text, photo, video or GIF.")
+                await run("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (k, json.dumps(data)))
+        else:
+            if not m.text:
+                return await m.answer("❌ Send text only.")
+            plain = m.text.strip()
+            if key == "defb":
+                if plain.lower() in ("off", "none", "default"):
+                    await run("DELETE FROM settings WHERE key='default_b_link'")
+                else:
+                    link = plain
+                    if link.startswith("@"):
+                        link = "https://t.me/" + link[1:]
+                    elif link.startswith("t.me/"):
+                        link = "https://" + link
+                    if not link.startswith("https://t.me/"):
+                        return await m.answer("❌ Send a valid link like https://t.me/yourchannel or @yourchannel (or off).")
+                    await run("INSERT OR REPLACE INTO settings(key,value) VALUES('default_b_link',?)", (link,))
+            elif key == "name":
+                await bot.set_my_name(name=plain[:64])
+            elif key == "desc":
+                await bot.set_my_description(description=plain[:512])
+            elif key == "about":
+                await bot.set_my_short_description(short_description=plain[:120])
     except TelegramAPIError as e:
         return await m.answer(f"❌ Failed: {e}")
     await state.clear()
@@ -933,7 +1145,7 @@ async def adm_bc(c: CallbackQuery, state: FSMContext):
     if not owner_only(c):
         return await c.answer("Owner only", show_alert=True)
     await state.set_state(Broadcast.waiting)
-    await c.message.answer("📢 Send the message you want to broadcast (text / photo / video / anything).\n/cancel to stop.")
+    await c.message.answer("📢 Send the message to broadcast (text / photo / video / anything).\n/cancel to stop.")
     await c.answer()
 
 
@@ -944,10 +1156,7 @@ async def bc_got(m: Message, state: FSMContext):
     n = (await one("SELECT COUNT(*) n FROM users WHERE banned=0"))["n"]
     await state.update_data(chat_id=m.chat.id, message_id=m.message_id)
     await state.set_state(Broadcast.confirm)
-    await m.answer(
-        f"Send this to <b>{n}</b> users?",
-        reply_markup=kb([[("✅ Send", "bc:go"), ("❌ Cancel", "bc:no")]]),
-    )
+    await m.answer(f"Send this to <b>{n}</b> users?", reply_markup=kb([[("✅ Send", "bc:go"), ("❌ Cancel", "bc:no")]]))
 
 
 async def do_broadcast(bot: Bot, src_chat, src_msg, notify_id):
@@ -966,7 +1175,8 @@ async def do_broadcast(bot: Bot, src_chat, src_msg, notify_id):
                 fail += 1
                 break
         await asyncio.sleep(0.05)
-    await bot.send_message(notify_id, f"📢 Broadcast finished\n✅ Sent: {ok}\n❌ Failed: {fail}")
+    with suppress(TelegramAPIError):
+        await bot.send_message(notify_id, f"📢 Broadcast finished\n✅ Sent: {ok}\n❌ Failed: {fail}")
 
 
 @router.callback_query(Broadcast.confirm, F.data.in_({"bc:go", "bc:no"}))
@@ -979,7 +1189,7 @@ async def bc_confirm(c: CallbackQuery, state: FSMContext, bot: Bot):
         await show(c.message, "❌ Broadcast cancelled")
         return await c.answer()
     asyncio.create_task(do_broadcast(bot, data["chat_id"], data["message_id"], c.from_user.id))
-    await show(c.message, "⏳ Broadcasting... I'll notify you when done.")
+    await show(c.message, "⏳ Broadcasting... I will notify you when done.")
     await c.answer()
 
 
@@ -991,17 +1201,18 @@ async def main():
         raise SystemExit("Set BOT_TOKEN and OWNER_ID in .env")
     await init_db()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    bot.session.middleware(StyleMiddleware())
     dp = Dispatcher(storage=MemoryStorage())
     dp.message.outer_middleware(BanMiddleware())
     dp.callback_query.outer_middleware(BanMiddleware())
     dp.include_router(router)
     await bot.set_my_commands(
         [
-            BotCommand(command="start", description="Start / शुरू करें"),
-            BotCommand(command="help", description="Guide / गाइड"),
-            BotCommand(command="settings", description="Channel settings / सेटिंग्स"),
-            BotCommand(command="approve_all", description="Accept all pending / सब approve करें"),
-            BotCommand(command="cancel", description="Cancel / रद्द करें"),
+            BotCommand(command="start", description=style("Start")),
+            BotCommand(command="help", description=style("Guide")),
+            BotCommand(command="settings", description=style("Channel settings")),
+            BotCommand(command="accept_all", description=style("Accept all pending requests")),
+            BotCommand(command="cancel", description=style("Cancel")),
         ]
     )
     await bot.delete_webhook(drop_pending_updates=False)
