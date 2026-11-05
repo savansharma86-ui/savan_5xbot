@@ -941,7 +941,7 @@ async def on_join_request(req: ChatJoinRequest, bot: Bot):
         markup = None
         if gate_link:
             rows = [[InlineKeyboardButton(text="📣 Open channel & send request", url=gate_link)]]
-            if o["b_id"]:
+            if o["b_id"] and auto:
                 rows.append([InlineKeyboardButton(text="✅ Done — I already joined", callback_data=f"chk:{chat_id}")])
             markup = InlineKeyboardMarkup(inline_keyboard=rows)
         sent = False
