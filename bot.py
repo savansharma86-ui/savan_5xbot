@@ -1,5 +1,5 @@
 """
-JoinGate Bot v3 - 2 channel join-request approval bot
+JoinGate Bot v4 - 2 channel join-request approval bot
 aiogram 3.13+ / aiosqlite / long polling
 
 Note: the Bot API cannot approve requests that arrived before the bot was running.
@@ -29,8 +29,10 @@ from aiogram.types import (
     ChatJoinRequest,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     LinkPreviewOptions,
     Message,
+    ReplyKeyboardMarkup,
 )
 from dotenv import load_dotenv
 
@@ -40,18 +42,19 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 DB_PATH = os.getenv("DB_PATH", "joingate.db")
+DAY = 86400
 
 router = Router()
 db: aiosqlite.Connection = None  # type: ignore
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
+
 # ----------------------------------------------------------------------------
-# Small-caps style: "Savan" -> "Sᴀᴠᴀɴ" for EVERY outgoing message and button.
+# Small-caps style: "Savan" -> "Sᴀᴠᴀɴ" for EVERY outgoing message, caption and button.
 # Set STYLE=0 in .env to turn it off.
 # ----------------------------------------------------------------------------
 STYLE_ON = os.getenv("STYLE", "1") != "0"
 _SC = dict(zip("abcdefghijklmnopqrstuvwxyz", "ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘǫʀꜱᴛᴜᴠᴡxʏᴢ"))
-# parts that must stay untouched: <code>..</code>, html tags, entities, links, @names, /commands, {placeholders}
 _SKIP = re.compile(
     r"(<code>.*?</code>|<[^>]+>|&[a-zA-Z#0-9]+;|https?://\S+|\bt\.me/\S+|@\w+|(?<![\w/])/[A-Za-z_]+|\{[^}]*\})",
     re.S,
@@ -74,7 +77,7 @@ def style(text):
 
 
 class StyleMiddleware(BaseRequestMiddleware):
-    """Applies the small-caps style to the text, caption and buttons of every outgoing request."""
+    """Applies the small-caps style to the text, caption and every button of every outgoing request."""
 
     async def __call__(self, make_request, bot, method):
         for attr in ("text", "caption"):
@@ -85,6 +88,12 @@ class StyleMiddleware(BaseRequestMiddleware):
         if isinstance(rm, InlineKeyboardMarkup):
             rows = [[b.model_copy(update={"text": style(b.text)}) for b in row] for row in rm.inline_keyboard]
             method.reply_markup = InlineKeyboardMarkup(inline_keyboard=rows)
+        elif isinstance(rm, ReplyKeyboardMarkup):
+            rows = [
+                [b.model_copy(update={"text": style(b.text)}) if b.text else b for b in row]
+                for row in rm.keyboard
+            ]
+            method.reply_markup = rm.model_copy(update={"keyboard": rows})
         return await make_request(bot, method)
 
 
@@ -115,8 +124,8 @@ DEFAULT_START = sections(
     ),
     box(
         "Quick start",
-        "Tap ⚙️ Settings to connect your channel. Tap 📖 Help for the full guide.",
-        "Channel connect karne ke liye ⚙️ Settings dabao. Poori guide ke liye 📖 Help dabao.",
+        "Use the menu below, or tap ⚙️ Settings to connect your channel.",
+        "Neeche wala menu use karo, ya channel connect karne ke liye ⚙️ Settings dabao.",
     ),
     box("Price", "100% free for everyone.", "Sabke liye bilkul free."),
 )
@@ -149,9 +158,9 @@ DEFAULT_HELP = sections(
         "Apne channel me admin ke roop me <code>/accept_all</code> likho, us channel ki saari pending requests approve ho jayengi. Ye command bot me bhi chalta hai.",
     ),
     box(
-        "6️⃣ Welcome message",
-        "Edit it anytime in ⚙️ Settings. Use <code>{name}</code> for the user's name. You can add a photo or video too.",
-        "Settings me kabhi bhi badlo. User ka naam dalne ke liye <code>{name}</code> likho. Photo ya video bhi laga sakte ho.",
+        "6️⃣ Check status, get support",
+        "Tap 📊 My Status anytime to see your channels and numbers. Tap 💬 Support to message the bot owner directly.",
+        "Apna channel aur numbers dekhne ke liye kabhi bhi 📊 My Status dabao. Bot owner se seedha baat karne ke liye 💬 Support dabao.",
     ),
 )
 
@@ -179,17 +188,25 @@ MODE_TEXT = sections(
         "A user requests Channel A and gets your Channel B link. What should happen after they request Channel B?",
         "User Channel A me request karta hai aur use aapke Channel B ka link milta hai. B me request ke baad kya hona chahiye?",
     ),
-    box(
-        "✅ Auto-approve",
-        "Their Channel A request is approved automatically.",
-        "Unki A ki request automatically approve ho jayegi.",
-    ),
+    box("✅ Auto-approve", "Their Channel A request is approved automatically.", "Unki A ki request automatically approve ho jayegi."),
     box(
         "🕓 Manual",
         "Users only send requests. You approve later by posting <code>/accept_all</code> in your channel.",
         "Users sirf request bhejenge. Aap baad me channel me <code>/accept_all</code> likhkar approve karoge.",
     ),
 )
+
+MENU_STATUS, MENU_SUPPORT, MENU_SETTINGS, MENU_HELP = "📊 My Status", "💬 Support", "⚙️ Settings", "📖 Help"
+
+
+def main_menu_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=MENU_STATUS), KeyboardButton(text=MENU_SUPPORT)],
+            [KeyboardButton(text=MENU_SETTINGS), KeyboardButton(text=MENU_HELP)],
+        ],
+        resize_keyboard=True,
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -205,7 +222,8 @@ async def init_db():
             user_id INTEGER PRIMARY KEY,
             name TEXT, username TEXT,
             banned INTEGER DEFAULT 0,
-            created_at INTEGER
+            created_at INTEGER,
+            last_seen INTEGER
         );
         CREATE TABLE IF NOT EXISTS owners(
             user_id INTEGER PRIMARY KEY,
@@ -222,14 +240,22 @@ async def init_db():
             PRIMARY KEY(chat_id, user_id)
         );
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS support_msgs(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER, name TEXT, username TEXT,
+            content TEXT, created_at INTEGER,
+            status TEXT DEFAULT 'open'
+        );
         """
     )
     await db.commit()
-    try:  # migration for databases created by older versions
-        await db.execute("ALTER TABLE owners ADD COLUMN mode_confirmed INTEGER DEFAULT 0")
-        await db.commit()
-    except Exception:
-        pass
+    for stmt in (
+        "ALTER TABLE owners ADD COLUMN mode_confirmed INTEGER DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN last_seen INTEGER",
+    ):
+        with suppress(Exception):
+            await db.execute(stmt)
+            await db.commit()
 
 
 async def one(sql, args=()):
@@ -253,11 +279,17 @@ async def get_setting(key, default):
 
 
 async def upsert_user(u):
+    now = int(time.time())
     await run(
-        "INSERT INTO users(user_id,name,username,created_at) VALUES(?,?,?,?) "
-        "ON CONFLICT(user_id) DO UPDATE SET name=excluded.name, username=excluded.username",
-        (u.id, u.full_name, u.username, int(time.time())),
+        "INSERT INTO users(user_id,name,username,created_at,last_seen) VALUES(?,?,?,?,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET name=excluded.name, username=excluded.username, last_seen=excluded.last_seen",
+        (u.id, u.full_name, u.username, now, now),
     )
+
+
+async def touch_user(user_id):
+    with suppress(Exception):
+        await run("UPDATE users SET last_seen=? WHERE user_id=?", (int(time.time()), user_id))
 
 
 async def get_owner(uid):
@@ -287,7 +319,6 @@ def extract_content(m: Message):
 
 
 def parse_content(raw, legacy_escape=False):
-    """Return a content dict from a stored value (JSON, or legacy plain/HTML text)."""
     if not raw:
         return None
     try:
@@ -314,7 +345,6 @@ def content_preview(raw):
 
 
 async def send_content(bot: Bot, chat_id, data, markup=None, name=None, preview_url=None):
-    """Send stored content. For text, preview_url shows the channel card (logo + bio) under the text."""
     t = data.get("t", "text")
     c = data.get("c") or ""
     if name is not None:
@@ -327,9 +357,7 @@ async def send_content(bot: Bot, chat_id, data, markup=None, name=None, preview_
                 if preview_url
                 else NO_PREVIEW
             )
-            return await bot.send_message(
-                chat_id, c or "👋", reply_markup=markup, parse_mode=parse, link_preview_options=lp
-            )
+            return await bot.send_message(chat_id, c or "👋", reply_markup=markup, parse_mode=parse, link_preview_options=lp)
         sender = {
             "photo": bot.send_photo,
             "video": bot.send_video,
@@ -337,17 +365,9 @@ async def send_content(bot: Bot, chat_id, data, markup=None, name=None, preview_
             "document": bot.send_document,
         }[t]
         cap = c if 0 < len(c) <= 1024 else None
-        msg = await sender(
-            chat_id,
-            data["f"],
-            caption=cap,
-            reply_markup=markup if (cap or not c) else None,
-            parse_mode=parse,
-        )
+        msg = await sender(chat_id, data["f"], caption=cap, reply_markup=markup if (cap or not c) else None, parse_mode=parse)
         if c and cap is None:
-            await bot.send_message(
-                chat_id, c, reply_markup=markup, parse_mode=parse, link_preview_options=NO_PREVIEW
-            )
+            await bot.send_message(chat_id, c, reply_markup=markup, parse_mode=parse, link_preview_options=NO_PREVIEW)
         return msg
 
     for _ in range(2):
@@ -368,20 +388,17 @@ async def send_content(bot: Bot, chat_id, data, markup=None, name=None, preview_
 # UI helpers
 # ----------------------------------------------------------------------------
 def kb(rows):
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=d) for t, d in row] for row in rows]
-    )
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=d) for t, d in row] for row in rows])
 
 
 def home_kb(uid):
-    rows = [[("⚙️ Settings", "s:main"), ("📖 Help", "help")]]
+    rows = []
     if uid == OWNER_ID:
         rows.append([("👑 Admin Panel", "adm:main")])
-    return kb(rows)
+    return kb(rows) if rows else None
 
 
 async def show(msg: Message, text: str, markup=None):
-    """Edit the message if possible, otherwise send a new one (plain text if HTML is broken)."""
     try:
         await msg.edit_text(text, reply_markup=markup, link_preview_options=NO_PREVIEW)
     except TelegramBadRequest as e:
@@ -416,7 +433,7 @@ async def show_content(c: CallbackQuery, bot: Bot, key, default, markup):
 
 
 # ----------------------------------------------------------------------------
-# Middleware: banned users
+# Middlewares
 # ----------------------------------------------------------------------------
 class BanMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
@@ -425,6 +442,16 @@ class BanMiddleware(BaseMiddleware):
             r = await one("SELECT banned FROM users WHERE user_id=?", (user.id,))
             if r and r["banned"]:
                 return
+        return await handler(event, data)
+
+
+class SeenMiddleware(BaseMiddleware):
+    """Keeps last_seen fresh for 'monthly active users' stats."""
+
+    async def __call__(self, handler, event, data):
+        user = data.get("event_from_user")
+        if user:
+            await touch_user(user.id)
         return await handler(event, data)
 
 
@@ -448,8 +475,21 @@ class Broadcast(StatesGroup):
     confirm = State()
 
 
+class ChannelBroadcast(StatesGroup):
+    waiting = State()
+    confirm = State()
+
+
+class SupportMsg(StatesGroup):
+    waiting = State()
+
+
+class SupportReply(StatesGroup):
+    waiting = State()
+
+
 # ----------------------------------------------------------------------------
-# Commands (registered first so they always win over FSM handlers)
+# Commands
 # ----------------------------------------------------------------------------
 @router.message(CommandStart())
 async def cmd_start(m: Message, state: FSMContext, bot: Bot):
@@ -457,6 +497,7 @@ async def cmd_start(m: Message, state: FSMContext, bot: Bot):
     await upsert_user(m.from_user)
     data = await get_content("start_text", DEFAULT_START)
     await send_content(bot, m.chat.id, data, home_kb(m.from_user.id))
+    await m.answer("👇", reply_markup=main_menu_kb())
 
 
 @router.message(Command("help"))
@@ -465,6 +506,11 @@ async def cmd_help(m: Message, state: FSMContext, bot: Bot):
     await upsert_user(m.from_user)
     data = await get_content("help_text", DEFAULT_HELP)
     await send_content(bot, m.chat.id, data, kb([[("🏠 Home", "home")]]))
+
+
+@router.message(F.text == MENU_HELP)
+async def menu_help(m: Message, state: FSMContext, bot: Bot):
+    await cmd_help(m, state, bot)
 
 
 @router.message(Command("cancel"))
@@ -478,6 +524,18 @@ async def cmd_settings(m: Message, state: FSMContext):
     await state.clear()
     await upsert_user(m.from_user)
     text, markup = await settings_view(m.from_user.id)
+    await reply(m, text, markup)
+
+
+@router.message(F.text == MENU_SETTINGS)
+async def menu_settings(m: Message, state: FSMContext):
+    await cmd_settings(m, state)
+
+
+@router.message(F.text == MENU_STATUS)
+async def menu_status(m: Message, state: FSMContext):
+    await state.clear()
+    text, markup = await status_view(m.from_user.id)
     await reply(m, text, markup)
 
 
@@ -501,7 +559,7 @@ async def cmd_broadcast(m: Message, state: FSMContext):
     if m.from_user.id != OWNER_ID:
         return
     await state.set_state(Broadcast.waiting)
-    await m.answer("📢 Send the message to broadcast (text / photo / video / anything).\n/cancel to stop.")
+    await m.answer("📢 Send the message to broadcast to all bot users (text / photo / video / anything).\n/cancel to stop.")
 
 
 @router.message(Command("ban"))
@@ -530,6 +588,82 @@ async def cmd_unban(m: Message):
 
 
 # ----------------------------------------------------------------------------
+# Support: any user can message the bot owner; owner replies with one tap
+# ----------------------------------------------------------------------------
+@router.message(Command("support"))
+async def cmd_support(m: Message, state: FSMContext):
+    if m.from_user.id == OWNER_ID:
+        return await m.answer("You are the bot owner — users' messages will appear here with a Reply button.")
+    await state.set_state(SupportMsg.waiting)
+    await m.answer(
+        sections(
+            "💬 <b>Support</b>",
+            box(
+                "Send your message",
+                "Type your question or issue below. The bot owner will reply here directly.",
+                "Apna sawaal ya dikkat neeche likho. Bot owner yahin seedha reply karega.",
+            ),
+            "/cancel to stop.",
+        )
+    )
+
+
+@router.message(F.text == MENU_SUPPORT)
+async def menu_support(m: Message, state: FSMContext):
+    await cmd_support(m, state)
+
+
+@router.message(SupportMsg.waiting)
+async def support_got(m: Message, state: FSMContext, bot: Bot):
+    await state.clear()
+    u = m.from_user
+    data = extract_content(m)
+    cur = await db.execute(
+        "INSERT INTO support_msgs(user_id,name,username,content,created_at) VALUES(?,?,?,?,?)",
+        (u.id, u.full_name, u.username, json.dumps(data) if data else None, int(time.time())),
+    )
+    await db.commit()
+    ticket_id = cur.lastrowid
+    header = (
+        f"📩 <b>Support message #{ticket_id}</b>\nFrom: {escape(u.full_name)} "
+        f"(@{u.username or '-'}, <code>{u.id}</code>)"
+    )
+    with suppress(TelegramAPIError):
+        await bot.send_message(OWNER_ID, header, reply_markup=kb([[("↩️ Reply", f"sup:reply:{u.id}:{ticket_id}")]]))
+        await bot.copy_message(OWNER_ID, m.chat.id, m.message_id)
+    await m.answer(bi("✅ Sent! The owner will reply here.", "Bhej diya! Owner yahin reply karega."))
+
+
+@router.callback_query(F.data.startswith("sup:reply:"))
+async def sup_reply_start(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id != OWNER_ID:
+        return await c.answer("Owner only", show_alert=True)
+    parts = c.data.split(":")
+    target = int(parts[2])
+    ticket_id = int(parts[3]) if len(parts) > 3 else None
+    await state.set_state(SupportReply.waiting)
+    await state.update_data(target=target, ticket_id=ticket_id)
+    await c.message.answer(f"✏️ Type your reply to <code>{target}</code>.\n/cancel to stop.")
+    await c.answer()
+
+
+@router.message(SupportReply.waiting)
+async def sup_reply_send(m: Message, state: FSMContext, bot: Bot):
+    if m.from_user.id != OWNER_ID:
+        return
+    data = await state.get_data()
+    target, ticket_id = data.get("target"), data.get("ticket_id")
+    await state.clear()
+    try:
+        await bot.send_message(target, f"📩 <b>Reply from support</b>\n\n{m.html_text or ''}")
+        if ticket_id:
+            await run("UPDATE support_msgs SET status='replied' WHERE id=?", (ticket_id,))
+        await m.answer("✅ Sent.")
+    except TelegramAPIError as e:
+        await m.answer(f"❌ Could not deliver: {e}")
+
+
+# ----------------------------------------------------------------------------
 # Home / help callbacks
 # ----------------------------------------------------------------------------
 @router.callback_query(F.data == "home")
@@ -543,6 +677,34 @@ async def cb_home(c: CallbackQuery, state: FSMContext, bot: Bot):
 async def cb_help(c: CallbackQuery, bot: Bot):
     await show_content(c, bot, "help_text", DEFAULT_HELP, kb([[("🏠 Home", "home")]]))
     await c.answer()
+
+
+# ----------------------------------------------------------------------------
+# My Status (for any channel owner)
+# ----------------------------------------------------------------------------
+async def status_view(uid):
+    o = await get_owner(uid)
+    if not o["a_id"] and not o["b_id"]:
+        return (
+            sections("📊 <b>My Status</b>", box("No channel yet", "Connect a channel in ⚙️ Settings first.", "Pehle Settings me channel connect karo.")),
+            kb([[("⚙️ Go to Settings", "s:main")]]),
+        )
+    parts = ["📊 <b>My Status</b>"]
+    for w in ("a", "b"):
+        if o[f"{w}_id"]:
+            r = await one(
+                "SELECT COUNT(*) t, SUM(status='approved') a, SUM(status='pending') p, "
+                "SUM(status='approved' AND created_at >= ?) m FROM requests WHERE chat_id=?",
+                (int(time.time()) - 30 * DAY, o[f"{w}_id"]),
+            )
+            parts.append(
+                box(
+                    f"Channel {w.upper()} — {escape(o[f'{w}_title'])}",
+                    f"Total requests: {r['t'] or 0}\n✅ Approved (members added): {r['a'] or 0}\n"
+                    f"📅 Approved this month: {r['m'] or 0}\n⏳ Pending: {r['p'] or 0}",
+                )
+            )
+    return sections(*parts), kb([[("✅ Accept all", "s:approve"), ("⚙️ Settings", "s:main")]])
 
 
 # ----------------------------------------------------------------------------
@@ -590,7 +752,7 @@ async def settings_view(uid):
             [("📢 Set/Change A", "s:set:a"), ("📣 Set/Change B", "s:set:b")],
             [("🔄 New link A", "s:link:a"), ("🔄 New link B", "s:link:b")],
             [("🔀 Approve Mode", "s:mode"), ("✏️ Welcome msg", "s:welcome")],
-            [("📊 Stats", "s:stats"), ("✅ Accept all", "s:approve")],
+            [("📊 My Status", "s:stats"), ("✅ Accept all", "s:approve")],
             [("🏠 Home", "home")],
         ]
     )
@@ -606,13 +768,7 @@ async def cb_settings(c: CallbackQuery, state: FSMContext):
 
 
 def mode_kb():
-    return kb(
-        [
-            [("✅ Auto-approve", "md:chain")],
-            [("🕓 Manual (I approve later)", "md:later")],
-            [("⬅️ Back", "s:main")],
-        ]
-    )
+    return kb([[("✅ Auto-approve", "md:chain")], [("🕓 Manual (I approve later)", "md:later")], [("⬅️ Back", "s:main")]])
 
 
 @router.callback_query(F.data == "s:mode")
@@ -641,16 +797,8 @@ async def cb_set_channel(c: CallbackQuery, state: FSMContext):
     await c.message.answer(
         sections(
             f"📢 <b>Send Channel {which.upper()}</b>",
-            box(
-                "How to send",
-                "Send its @username, its ID (like -100123...), or forward any post from it.",
-                "Uska @username, ID (jaise -100123...) bhejo ya uska koi post forward karo.",
-            ),
-            box(
-                "Required",
-                "The bot must be admin there (Invite Users) and you must be admin too.",
-                "Bot wahan admin hona chahiye (Invite Users) aur aap bhi admin hone chahiye.",
-            ),
+            box("How to send", "Send its @username, its ID (like -100123...), or forward any post from it.", "Uska @username, ID (jaise -100123...) bhejo ya uska koi post forward karo."),
+            box("Required", "The bot must be admin there (Invite Users) and you must be admin too.", "Bot wahan admin hona chahiye (Invite Users) aur aap bhi admin hone chahiye."),
             "/cancel to stop.",
         )
     )
@@ -680,21 +828,9 @@ async def cb_welcome(c: CallbackQuery, state: FSMContext):
     await c.message.answer(
         sections(
             "✏️ <b>Edit welcome message</b>",
-            box(
-                "What to send",
-                "Send your new welcome message. Text, photo, video or GIF (with caption) all work. Use <code>{name}</code> for the user's name.",
-                "Naya welcome message bhejo. Text, photo, video ya GIF (caption ke saath) sab chalega. User ka naam dalne ke liye <code>{name}</code> likho.",
-            ),
-            box(
-                "Reset",
-                "Send <code>default</code> to go back to the default message.",
-                "Default par wapas jaane ke liye <code>default</code> bhejo.",
-            ),
-            box(
-                "Channel card",
-                "With a text welcome, the bot adds your Channel B card (logo + bio) automatically.",
-                "Text welcome ke saath bot Channel B ka card (logo + bio) khud laga deta hai.",
-            ),
+            box("What to send", "Send your new welcome message. Text, photo, video or GIF (with caption) all work. Use <code>{name}</code> for the user's name.", "Naya welcome message bhejo. Text, photo, video ya GIF (caption ke saath) sab chalega. User ka naam dalne ke liye <code>{name}</code> likho."),
+            box("Reset", "Send <code>default</code> to go back to the default message.", "Default par wapas jaane ke liye <code>default</code> bhejo."),
+            box("Channel card", "With a text welcome, the bot adds your Channel B card (logo + bio) automatically.", "Text welcome ke saath bot Channel B ka card (logo + bio) khud laga deta hai."),
             "/cancel to stop.",
         )
     )
@@ -735,12 +871,7 @@ async def got_channel(m: Message, state: FSMContext, bot: Bot):
                 ident = txt if txt.startswith("@") else "@" + txt.split("/")[0]
             chat = await bot.get_chat(ident)
     except TelegramAPIError:
-        return await m.answer(
-            bi(
-                "❌ Channel not found. Send @username, numeric ID, or forward a post. The bot must be admin there.",
-                "Channel nahi mila. @username, ID bhejo ya post forward karo. Bot wahan admin hona chahiye.",
-            )
-        )
+        return await m.answer(bi("❌ Channel not found. Send @username, numeric ID, or forward a post. The bot must be admin there.", "Channel nahi mila. @username, ID bhejo ya post forward karo. Bot wahan admin hona chahiye."))
 
     if chat.type not in ("channel", "supergroup", "group"):
         return await m.answer(bi("❌ This is not a channel or group.", "Ye channel ya group nahi hai."))
@@ -750,26 +881,16 @@ async def got_channel(m: Message, state: FSMContext, bot: Bot):
     except TelegramAPIError:
         return await m.answer(bi("❌ Add the bot as admin there first.", "Pehle bot ko wahan admin banao."))
     if me.status != ChatMemberStatus.ADMINISTRATOR or not getattr(me, "can_invite_users", False):
-        return await m.answer(
-            bi(
-                "❌ The bot needs admin rights with the Invite Users permission.",
-                "Bot ko Invite Users permission ke saath admin banao.",
-            )
-        )
+        return await m.answer(bi("❌ The bot needs admin rights with the Invite Users permission.", "Bot ko Invite Users permission ke saath admin banao."))
 
     try:
         um = await bot.get_chat_member(chat.id, m.from_user.id)
     except TelegramAPIError:
         um = None
-    if m.from_user.id != OWNER_ID and (
-        um is None or um.status not in (ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR)
-    ):
+    if m.from_user.id != OWNER_ID and (um is None or um.status not in (ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR)):
         return await m.answer(bi("❌ You must be an admin of that channel.", "Aap us channel ke admin nahi ho."))
 
-    used = await one(
-        "SELECT user_id FROM owners WHERE (a_id=? OR b_id=?) AND user_id!=?",
-        (chat.id, chat.id, m.from_user.id),
-    )
+    used = await one("SELECT user_id FROM owners WHERE (a_id=? OR b_id=?) AND user_id!=?", (chat.id, chat.id, m.from_user.id))
     if used:
         return await m.answer(bi("❌ This channel is already linked to another owner.", "Ye channel pehle se kisi aur owner se juda hai."))
 
@@ -794,29 +915,15 @@ async def got_channel(m: Message, state: FSMContext, bot: Bot):
     o = await get_owner(m.from_user.id)
     if o["a_id"] and o["b_id"] and not o["mode_confirmed"]:
         await m.answer(
-            bi("❓ <b>Both channels are set. Please confirm below.</b>", "Dono channel set hain. Neeche confirm karo.")
-            + "\n\n"
-            + MODE_TEXT,
+            bi("❓ <b>Both channels are set. Please confirm below.</b>", "Dono channel set hain. Neeche confirm karo.") + "\n\n" + MODE_TEXT,
             reply_markup=mode_kb(),
         )
 
 
 @router.callback_query(F.data == "s:stats")
 async def cb_stats(c: CallbackQuery):
-    o = await get_owner(c.from_user.id)
-    parts = ["📊 <b>Your Stats</b>"]
-    for w in ("a", "b"):
-        if o[f"{w}_id"]:
-            r = await one(
-                "SELECT COUNT(*) t, SUM(status='approved') a, SUM(status='pending') p FROM requests WHERE chat_id=?",
-                (o[f"{w}_id"],),
-            )
-            parts.append(
-                box(f"Channel {w.upper()}", f"Total: {r['t'] or 0}\n✅ Approved: {r['a'] or 0}\n⏳ Pending: {r['p'] or 0}")
-            )
-    if len(parts) == 1:
-        parts.append(box("No data", "No channels set yet.", "Abhi koi channel set nahi hai."))
-    await show(c.message, sections(*parts), kb([[("⬅️ Back", "s:main")]]))
+    text, markup = await status_view(c.from_user.id)
+    await show(c.message, text, markup)
     await c.answer()
 
 
@@ -842,11 +949,7 @@ async def approve_all_view(uid):
     rows.append([("❌ Close", "home")])
     text = sections(
         "✅ <b>Accept all pending requests</b>",
-        box(
-            "Note",
-            "Only requests received while the bot was running are counted.",
-            "Sirf wahi requests ginti me aati hain jo bot chalu hone par aayi thi.",
-        ),
+        box("Note", "Only requests received while the bot was running are counted.", "Sirf wahi requests ginti me aati hain jo bot chalu hone par aayi thi."),
     )
     return text, kb(rows)
 
@@ -873,15 +976,10 @@ async def approve_one(bot: Bot, chat_id, user_id) -> bool:
 async def run_approve_all(bot: Bot, chat_ids, notify_id):
     ok = fail = 0
     marks = ",".join("?" * len(chat_ids))
-    rows = await many(
-        f"SELECT chat_id,user_id FROM requests WHERE status='pending' AND chat_id IN ({marks})", chat_ids
-    )
+    rows = await many(f"SELECT chat_id,user_id FROM requests WHERE status='pending' AND chat_id IN ({marks})", chat_ids)
     for r in rows:
         good = await approve_one(bot, r["chat_id"], r["user_id"])
-        await run(
-            "UPDATE requests SET status=? WHERE chat_id=? AND user_id=?",
-            ("approved" if good else "failed", r["chat_id"], r["user_id"]),
-        )
+        await run("UPDATE requests SET status=? WHERE chat_id=? AND user_id=?", ("approved" if good else "failed", r["chat_id"], r["user_id"]))
         ok += good
         fail += not good
         await asyncio.sleep(0.1)
@@ -901,16 +999,12 @@ async def cb_approve_run(c: CallbackQuery, bot: Bot):
     if not ids:
         return await c.answer("Nothing to approve", show_alert=True)
     asyncio.create_task(run_approve_all(bot, ids, c.from_user.id))
-    await show(
-        c.message,
-        bi("⏳ Approving... I will message you when done.", "Approve ho raha hai, pura hone par bata dunga."),
-        kb([[("🏠 Home", "home")]]),
-    )
+    await show(c.message, bi("⏳ Approving... I will message you when done.", "Approve ho raha hai, pura hone par bata dunga."), kb([[("🏠 Home", "home")]]))
     await c.answer()
 
 
 # ----------------------------------------------------------------------------
-# Join requests (the core flow) - the DM goes out FIRST, before any database work
+# Join requests - the DM goes out FIRST, before any database work
 # ----------------------------------------------------------------------------
 async def record_request(chat_id, user, owner_id):
     await upsert_user(user)
@@ -930,25 +1024,16 @@ async def on_join_request(req: ChatJoinRequest, bot: Bot):
     target = req.user_chat_id or user.id
 
     if o["a_id"] == chat_id:
-        # gate link = owner's own Channel B, otherwise the bot owner's default link
         gate_link = (o["b_link"] if o["b_id"] else None) or (await get_setting("default_b_link", "")) or None
         auto = bool(o["b_id"] and o["mode"] == "chain" and o["mode_confirmed"])
-        data = parse_content(o["welcome"], legacy_escape=True) or {
-            "t": "text",
-            "c": default_welcome(auto, bool(gate_link)),
-        }
+        data = parse_content(o["welcome"], legacy_escape=True) or {"t": "text", "c": default_welcome(auto, bool(gate_link))}
         markup = None
         if gate_link:
-            markup = InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="📣 Open channel & send request", url=gate_link)]]
-            )
-        # Telegram lets the bot DM a requester via user_chat_id even if they never started the bot
+            markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📣 Open channel & send request", url=gate_link)]])
         sent = False
         for dest in dict.fromkeys([target, user.id]):
             try:
-                await send_content(
-                    bot, dest, data, markup, name=user.first_name or "friend", preview_url=gate_link
-                )
+                await send_content(bot, dest, data, markup, name=user.first_name or "friend", preview_url=gate_link)
                 sent = True
                 logging.info("DM sent to %s for request in chat %s", user.id, chat_id)
                 break
@@ -959,30 +1044,19 @@ async def on_join_request(req: ChatJoinRequest, bot: Bot):
         await record_request(chat_id, user, o["user_id"])
         return
 
-    # request came to the owner's own Channel B
     await record_request(chat_id, user, o["user_id"])
     if o["mode"] == "chain" and o["mode_confirmed"] and o["a_id"]:
-        pending_a = await one(
-            "SELECT 1 FROM requests WHERE chat_id=? AND user_id=? AND status='pending'",
-            (o["a_id"], user.id),
-        )
+        pending_a = await one("SELECT 1 FROM requests WHERE chat_id=? AND user_id=? AND status='pending'", (o["a_id"], user.id))
         if pending_a:
             good = await approve_one(bot, o["a_id"], user.id)
-            await run(
-                "UPDATE requests SET status=? WHERE chat_id=? AND user_id=?",
-                ("approved" if good else "failed", o["a_id"], user.id),
-            )
+            await run("UPDATE requests SET status=? WHERE chat_id=? AND user_id=?", ("approved" if good else "failed", o["a_id"], user.id))
             if good:
                 with suppress(TelegramAPIError):
-                    await bot.send_message(
-                        target,
-                        "🎉 <b>You are approved!</b>\n<i>Aap approve ho gaye ho.</i>",
-                    )
+                    await bot.send_message(target, "🎉 <b>You are approved!</b>\n<i>Aap approve ho gaye ho.</i>")
 
 
 @router.channel_post(F.text)
 async def on_channel_post(m: Message, bot: Bot):
-    """A channel admin posts /accept_all inside the channel -> approve all pending requests of that channel."""
     cmd = m.text.strip().split()[0].lower().split("@")[0]
     if cmd not in ("/accept_all", "/approve_all"):
         return
@@ -1008,7 +1082,8 @@ def admin_kb():
     return kb(
         [
             [("📊 Stats", "adm:stats"), ("👥 Channel owners", "adm:owners")],
-            [("📢 Broadcast", "adm:bc")],
+            [("📥 Support Inbox", "adm:inbox")],
+            [("📢 Broadcast (users)", "adm:bc"), ("📣 Broadcast (channels)", "adm:cbc")],
             [("✏️ Edit /start", "adm:edit:start"), ("✏️ Edit /help", "adm:edit:help")],
             [("🎯 Default gate link", "adm:edit:defb")],
             [("🤖 Bot name", "adm:edit:name")],
@@ -1035,16 +1110,28 @@ async def adm_main(c: CallbackQuery, state: FSMContext):
 async def adm_stats(c: CallbackQuery):
     if not owner_only(c):
         return await c.answer("Owner only", show_alert=True)
+    cutoff = int(time.time()) - 30 * DAY
     u = await one("SELECT COUNT(*) n, SUM(banned) b FROM users")
-    o = await one("SELECT COUNT(*) n FROM owners WHERE a_id IS NOT NULL OR b_id IS NOT NULL")
-    r = await one("SELECT COUNT(*) n, SUM(status='approved') a, SUM(status='pending') p FROM requests")
+    active = (await one("SELECT COUNT(*) n FROM users WHERE last_seen >= ?", (cutoff,)))["n"]
+    ch = await one(
+        "SELECT (SELECT COUNT(*) FROM owners WHERE a_id IS NOT NULL) + (SELECT COUNT(*) FROM owners WHERE b_id IS NOT NULL) n"
+    )
+    owners = (await one("SELECT COUNT(*) n FROM owners WHERE a_id IS NOT NULL OR b_id IS NOT NULL"))["n"]
+    r = await one(
+        "SELECT COUNT(*) n, SUM(status='approved') a, SUM(status='pending') p, "
+        "SUM(status='approved' AND created_at >= ?) m FROM requests",
+        (cutoff,),
+    )
     text = sections(
         "📊 <b>Bot Stats</b>",
-        box("Users", f"Total: {u['n']}\nBanned: {u['b'] or 0}"),
-        box("Channel owners", f"{o['n']}"),
-        box("Requests", f"Total: {r['n']}\n✅ Approved: {r['a'] or 0}\n⏳ Pending: {r['p'] or 0}"),
+        box("Bot users", f"Total: {u['n']}\n📅 Active last 30 days: {active}\n🚫 Banned: {u['b'] or 0}"),
+        box("Channels", f"Bot is admin in: {ch['n']}\nChannel owners: {owners}"),
+        box(
+            "Members added (via requests)",
+            f"Total approved: {r['a'] or 0}\n📅 Approved last 30 days: {r['m'] or 0}\n⏳ Pending: {r['p'] or 0}\nAll requests: {r['n']}",
+        ),
     )
-    await show(c.message, text, kb([[("⬅️ Back", "adm:main")]]))
+    await show(c.message, text, kb([[("👥 Per-owner breakdown", "adm:owners")], [("⬅️ Back", "adm:main")]]))
     await c.answer()
 
 
@@ -1052,20 +1139,27 @@ async def adm_stats(c: CallbackQuery):
 async def adm_owners(c: CallbackQuery):
     if not owner_only(c):
         return await c.answer("Owner only", show_alert=True)
-    rows = await many(
-        "SELECT user_id,a_title,b_title,mode FROM owners WHERE a_id IS NOT NULL OR b_id IS NOT NULL LIMIT 50"
-    )
-    lines = ["👥 <b>Channel owners</b> (ban with /ban ID)"]
+    cutoff = int(time.time()) - 30 * DAY
+    rows = await many("SELECT user_id,a_id,a_title,b_id,b_title,mode,mode_confirmed FROM owners WHERE a_id IS NOT NULL OR b_id IS NOT NULL LIMIT 40")
+    parts = ["👥 <b>Channel owners</b> — members added via this bot (ban with /ban ID)"]
     for r in rows:
-        lines.append(
+        ids = [r["a_id"], r["b_id"]]
+        ids = [i for i in ids if i]
+        marks = ",".join("?" * len(ids))
+        agg = await one(
+            f"SELECT SUM(status='approved') a, SUM(status='approved' AND created_at >= ?) m FROM requests WHERE chat_id IN ({marks})",
+            (cutoff, *ids),
+        )
+        parts.append(
             box(
                 f"<code>{r['user_id']}</code>",
-                f"A: {escape(r['a_title'] or '-')}\nB: {escape(r['b_title'] or '-')}\nMode: {r['mode']}",
+                f"A: {escape(r['a_title'] or '-')}\nB: {escape(r['b_title'] or '-')}\n"
+                f"👥 Total members: {agg['a'] or 0} | 📅 This month: {agg['m'] or 0}",
             )
         )
     if not rows:
-        lines.append("No one yet.")
-    await show(c.message, sections(*lines), kb([[("⬅️ Back", "adm:main")]]))
+        parts.append("No one yet.")
+    await show(c.message, sections(*parts), kb([[("⬅️ Back", "adm:main")]]))
     await c.answer()
 
 
@@ -1077,6 +1171,32 @@ EDIT_PROMPTS = {
     "desc": "📝 Send the new bot <b>description</b> (max 512 chars).",
     "about": "💬 Send the new bot <b>about</b> text (max 120 chars).",
 }
+
+
+@router.callback_query(F.data == "adm:inbox")
+async def adm_inbox(c: CallbackQuery):
+    if not owner_only(c):
+        return await c.answer("Owner only", show_alert=True)
+    rows = await many(
+        "SELECT id,user_id,name,username,content,status,created_at FROM support_msgs ORDER BY id DESC LIMIT 15"
+    )
+    if not rows:
+        return await show(c.message, sections("📥 <b>Support Inbox</b>", "No messages yet.\n<i>Abhi koi message nahi hai.</i>"), kb([[("⬅️ Back", "adm:main")]]))
+    parts = ["📥 <b>Support Inbox</b> — latest 15"]
+    buttons = []
+    for r in rows:
+        tag = "✅" if r["status"] == "replied" else "🆕"
+        parts.append(
+            box(
+                f"{tag} #{r['id']} — {escape(r['name'] or '-')} (@{r['username'] or '-'})",
+                content_preview(r["content"]) or "(no text)",
+            )
+        )
+        if r["status"] != "replied":
+            buttons.append([(f"↩️ Reply #{r['id']}", f"sup:reply:{r['user_id']}:{r['id']}")])
+    buttons.append([("⬅️ Back", "adm:main")])
+    await show(c.message, sections(*parts), kb(buttons))
+    await c.answer()
 
 
 @router.callback_query(F.data.startswith("adm:edit:"))
@@ -1138,14 +1258,14 @@ async def adm_edit_got(m: Message, state: FSMContext, bot: Bot):
 
 
 # ----------------------------------------------------------------------------
-# Broadcast (bot owner only)
+# Broadcast to USERS (bot owner only) - DMs everyone who has talked to the bot
 # ----------------------------------------------------------------------------
 @router.callback_query(F.data == "adm:bc")
 async def adm_bc(c: CallbackQuery, state: FSMContext):
     if not owner_only(c):
         return await c.answer("Owner only", show_alert=True)
     await state.set_state(Broadcast.waiting)
-    await c.message.answer("📢 Send the message to broadcast (text / photo / video / anything).\n/cancel to stop.")
+    await c.message.answer("📢 Send the message to broadcast to all bot users (text / photo / video / anything).\n/cancel to stop.")
     await c.answer()
 
 
@@ -1156,7 +1276,7 @@ async def bc_got(m: Message, state: FSMContext):
     n = (await one("SELECT COUNT(*) n FROM users WHERE banned=0"))["n"]
     await state.update_data(chat_id=m.chat.id, message_id=m.message_id)
     await state.set_state(Broadcast.confirm)
-    await m.answer(f"Send this to <b>{n}</b> users?", reply_markup=kb([[("✅ Send", "bc:go"), ("❌ Cancel", "bc:no")]]))
+    await m.answer(f"Send this to <b>{n}</b> bot users?", reply_markup=kb([[("✅ Send", "bc:go"), ("❌ Cancel", "bc:no")]]))
 
 
 async def do_broadcast(bot: Bot, src_chat, src_msg, notify_id):
@@ -1176,7 +1296,7 @@ async def do_broadcast(bot: Bot, src_chat, src_msg, notify_id):
                 break
         await asyncio.sleep(0.05)
     with suppress(TelegramAPIError):
-        await bot.send_message(notify_id, f"📢 Broadcast finished\n✅ Sent: {ok}\n❌ Failed: {fail}")
+        await bot.send_message(notify_id, f"📢 User broadcast finished\n✅ Sent: {ok}\n❌ Failed: {fail}")
 
 
 @router.callback_query(Broadcast.confirm, F.data.in_({"bc:go", "bc:no"}))
@@ -1189,7 +1309,73 @@ async def bc_confirm(c: CallbackQuery, state: FSMContext, bot: Bot):
         await show(c.message, "❌ Broadcast cancelled")
         return await c.answer()
     asyncio.create_task(do_broadcast(bot, data["chat_id"], data["message_id"], c.from_user.id))
-    await show(c.message, "⏳ Broadcasting... I will notify you when done.")
+    await show(c.message, "⏳ Broadcasting to users... I will notify you when done.")
+    await c.answer()
+
+
+# ----------------------------------------------------------------------------
+# Broadcast to CHANNELS (bot owner only) - posts into every channel where the
+# bot is admin through this system (every owner's Channel A and B).
+# ----------------------------------------------------------------------------
+async def all_admin_channels():
+    rows = await many(
+        "SELECT a_id c FROM owners WHERE a_id IS NOT NULL UNION SELECT b_id c FROM owners WHERE b_id IS NOT NULL"
+    )
+    return [r["c"] for r in rows]
+
+
+@router.callback_query(F.data == "adm:cbc")
+async def adm_cbc(c: CallbackQuery, state: FSMContext):
+    if not owner_only(c):
+        return await c.answer("Owner only", show_alert=True)
+    n = len(await all_admin_channels())
+    await state.set_state(ChannelBroadcast.waiting)
+    await c.message.answer(
+        f"📣 Send the message to post in all <b>{n}</b> channels the bot is admin in (not a DM — posted directly in the channels).\n/cancel to stop."
+    )
+    await c.answer()
+
+
+@router.message(ChannelBroadcast.waiting)
+async def cbc_got(m: Message, state: FSMContext):
+    if m.from_user.id != OWNER_ID:
+        return
+    n = len(await all_admin_channels())
+    await state.update_data(chat_id=m.chat.id, message_id=m.message_id)
+    await state.set_state(ChannelBroadcast.confirm)
+    await m.answer(f"Post this in <b>{n}</b> channels?", reply_markup=kb([[("✅ Post", "cbc:go"), ("❌ Cancel", "cbc:no")]]))
+
+
+async def do_channel_broadcast(bot: Bot, src_chat, src_msg, notify_id):
+    ids = await all_admin_channels()
+    ok = fail = 0
+    for cid in ids:
+        for _ in range(2):
+            try:
+                await bot.copy_message(cid, src_chat, src_msg)
+                ok += 1
+                break
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
+            except TelegramAPIError:
+                fail += 1
+                break
+        await asyncio.sleep(0.2)
+    with suppress(TelegramAPIError):
+        await bot.send_message(notify_id, f"📣 Channel broadcast finished\n✅ Posted: {ok}\n❌ Failed: {fail}")
+
+
+@router.callback_query(ChannelBroadcast.confirm, F.data.in_({"cbc:go", "cbc:no"}))
+async def cbc_confirm(c: CallbackQuery, state: FSMContext, bot: Bot):
+    if not owner_only(c):
+        return await c.answer("Owner only", show_alert=True)
+    data = await state.get_data()
+    await state.clear()
+    if c.data == "cbc:no":
+        await show(c.message, "❌ Channel broadcast cancelled")
+        return await c.answer()
+    asyncio.create_task(do_channel_broadcast(bot, data["chat_id"], data["message_id"], c.from_user.id))
+    await show(c.message, "⏳ Posting to channels... I will notify you when done.")
     await c.answer()
 
 
@@ -1205,6 +1391,8 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.message.outer_middleware(BanMiddleware())
     dp.callback_query.outer_middleware(BanMiddleware())
+    dp.message.outer_middleware(SeenMiddleware())
+    dp.callback_query.outer_middleware(SeenMiddleware())
     dp.include_router(router)
     await bot.set_my_commands(
         [
@@ -1212,6 +1400,7 @@ async def main():
             BotCommand(command="help", description=style("Guide")),
             BotCommand(command="settings", description=style("Channel settings")),
             BotCommand(command="accept_all", description=style("Accept all pending requests")),
+            BotCommand(command="support", description=style("Contact bot owner")),
             BotCommand(command="cancel", description=style("Cancel")),
         ]
     )
