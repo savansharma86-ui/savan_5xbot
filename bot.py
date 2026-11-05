@@ -88,12 +88,6 @@ class StyleMiddleware(BaseRequestMiddleware):
         if isinstance(rm, InlineKeyboardMarkup):
             rows = [[b.model_copy(update={"text": style(b.text)}) for b in row] for row in rm.inline_keyboard]
             method.reply_markup = InlineKeyboardMarkup(inline_keyboard=rows)
-        elif isinstance(rm, ReplyKeyboardMarkup):
-            rows = [
-                [b.model_copy(update={"text": style(b.text)}) if b.text else b for b in row]
-                for row in rm.keyboard
-            ]
-            method.reply_markup = rm.model_copy(update={"keyboard": rows})
         return await make_request(bot, method)
 
 
@@ -392,10 +386,10 @@ def kb(rows):
 
 
 def home_kb(uid):
-    rows = []
+    rows = [[("⚙️ Settings", "s:main"), ("📖 Help", "help")]]
     if uid == OWNER_ID:
         rows.append([("👑 Admin Panel", "adm:main")])
-    return kb(rows) if rows else None
+    return kb(rows)
 
 
 async def show(msg: Message, text: str, markup=None):
