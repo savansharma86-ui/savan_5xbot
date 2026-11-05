@@ -152,9 +152,9 @@ DEFAULT_HELP = sections(
         "Apne channel me admin ke roop me <code>/accept_all</code> likho, us channel ki saari pending requests approve ho jayengi. Ye command bot me bhi chalta hai.",
     ),
     box(
-        "6️⃣ Check status, get support",
-        "Tap 📊 My Status anytime to see your channels and numbers. Tap 💬 Support to message the bot owner directly.",
-        "Apna channel aur numbers dekhne ke liye kabhi bhi 📊 My Status dabao. Bot owner se seedha baat karne ke liye 💬 Support dabao.",
+        "6️⃣ Check your status",
+        "Tap 📊 My Status anytime to see your channels and numbers.",
+        "Apna channel aur numbers dekhne ke liye kabhi bhi 📊 My Status dabao.",
     ),
 )
 
@@ -190,14 +190,14 @@ MODE_TEXT = sections(
     ),
 )
 
-MENU_STATUS, MENU_SUPPORT, MENU_SETTINGS, MENU_HELP = "📊 My Status", "💬 Support", "⚙️ Settings", "📖 Help"
+MENU_STATUS, MENU_SETTINGS, MENU_HELP = "📊 My Status", "⚙️ Settings", "📖 Help"
 
 
 def main_menu_kb():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=MENU_STATUS), KeyboardButton(text=MENU_SUPPORT)],
-            [KeyboardButton(text=MENU_SETTINGS), KeyboardButton(text=MENU_HELP)],
+            [KeyboardButton(text=MENU_STATUS), KeyboardButton(text=MENU_SETTINGS)],
+            [KeyboardButton(text=MENU_HELP)],
         ],
         resize_keyboard=True,
     )
@@ -234,12 +234,6 @@ async def init_db():
             PRIMARY KEY(chat_id, user_id)
         );
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
-        CREATE TABLE IF NOT EXISTS support_msgs(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER, name TEXT, username TEXT,
-            content TEXT, created_at INTEGER,
-            status TEXT DEFAULT 'open'
-        );
         """
     )
     await db.commit()
@@ -474,14 +468,6 @@ class ChannelBroadcast(StatesGroup):
     confirm = State()
 
 
-class SupportMsg(StatesGroup):
-    waiting = State()
-
-
-class SupportReply(StatesGroup):
-    waiting = State()
-
-
 # ----------------------------------------------------------------------------
 # Commands
 # ----------------------------------------------------------------------------
@@ -579,82 +565,6 @@ async def cmd_unban(m: Message):
         return await m.answer("Usage: /unban USER_ID")
     await run("UPDATE users SET banned=0 WHERE user_id=?", (int(parts[1]),))
     await m.answer(f"✅ Unbanned {parts[1]}")
-
-
-# ----------------------------------------------------------------------------
-# Support: any user can message the bot owner; owner replies with one tap
-# ----------------------------------------------------------------------------
-@router.message(Command("support"))
-async def cmd_support(m: Message, state: FSMContext):
-    if m.from_user.id == OWNER_ID:
-        return await m.answer("You are the bot owner — users' messages will appear here with a Reply button.")
-    await state.set_state(SupportMsg.waiting)
-    await m.answer(
-        sections(
-            "💬 <b>Support</b>",
-            box(
-                "Send your message",
-                "Type your question or issue below. The bot owner will reply here directly.",
-                "Apna sawaal ya dikkat neeche likho. Bot owner yahin seedha reply karega.",
-            ),
-            "/cancel to stop.",
-        )
-    )
-
-
-@router.message(F.text == MENU_SUPPORT)
-async def menu_support(m: Message, state: FSMContext):
-    await cmd_support(m, state)
-
-
-@router.message(SupportMsg.waiting)
-async def support_got(m: Message, state: FSMContext, bot: Bot):
-    await state.clear()
-    u = m.from_user
-    data = extract_content(m)
-    cur = await db.execute(
-        "INSERT INTO support_msgs(user_id,name,username,content,created_at) VALUES(?,?,?,?,?)",
-        (u.id, u.full_name, u.username, json.dumps(data) if data else None, int(time.time())),
-    )
-    await db.commit()
-    ticket_id = cur.lastrowid
-    header = (
-        f"📩 <b>Support message #{ticket_id}</b>\nFrom: {escape(u.full_name)} "
-        f"(@{u.username or '-'}, <code>{u.id}</code>)"
-    )
-    with suppress(TelegramAPIError):
-        await bot.send_message(OWNER_ID, header, reply_markup=kb([[("↩️ Reply", f"sup:reply:{u.id}:{ticket_id}")]]))
-        await bot.copy_message(OWNER_ID, m.chat.id, m.message_id)
-    await m.answer(bi("✅ Sent! The owner will reply here.", "Bhej diya! Owner yahin reply karega."))
-
-
-@router.callback_query(F.data.startswith("sup:reply:"))
-async def sup_reply_start(c: CallbackQuery, state: FSMContext):
-    if c.from_user.id != OWNER_ID:
-        return await c.answer("Owner only", show_alert=True)
-    parts = c.data.split(":")
-    target = int(parts[2])
-    ticket_id = int(parts[3]) if len(parts) > 3 else None
-    await state.set_state(SupportReply.waiting)
-    await state.update_data(target=target, ticket_id=ticket_id)
-    await c.message.answer(f"✏️ Type your reply to <code>{target}</code>.\n/cancel to stop.")
-    await c.answer()
-
-
-@router.message(SupportReply.waiting)
-async def sup_reply_send(m: Message, state: FSMContext, bot: Bot):
-    if m.from_user.id != OWNER_ID:
-        return
-    data = await state.get_data()
-    target, ticket_id = data.get("target"), data.get("ticket_id")
-    await state.clear()
-    try:
-        await bot.send_message(target, f"📩 <b>Reply from support</b>\n\n{m.html_text or ''}")
-        if ticket_id:
-            await run("UPDATE support_msgs SET status='replied' WHERE id=?", (ticket_id,))
-        await m.answer("✅ Sent.")
-    except TelegramAPIError as e:
-        await m.answer(f"❌ Could not deliver: {e}")
 
 
 # ----------------------------------------------------------------------------
@@ -1137,7 +1047,6 @@ def admin_kb():
     return kb(
         [
             [("📊 Stats", "adm:stats"), ("👥 Channel owners", "adm:owners")],
-            [("📥 Support Inbox", "adm:inbox")],
             [("📢 Broadcast (users)", "adm:bc"), ("📣 Broadcast (channels)", "adm:cbc")],
             [("✏️ Edit /start", "adm:edit:start"), ("✏️ Edit /help", "adm:edit:help")],
             [("🎯 Default gate link", "adm:edit:defb")],
@@ -1226,32 +1135,6 @@ EDIT_PROMPTS = {
     "desc": "📝 Send the new bot <b>description</b> (max 512 chars).",
     "about": "💬 Send the new bot <b>about</b> text (max 120 chars).",
 }
-
-
-@router.callback_query(F.data == "adm:inbox")
-async def adm_inbox(c: CallbackQuery):
-    if not owner_only(c):
-        return await c.answer("Owner only", show_alert=True)
-    rows = await many(
-        "SELECT id,user_id,name,username,content,status,created_at FROM support_msgs ORDER BY id DESC LIMIT 15"
-    )
-    if not rows:
-        return await show(c.message, sections("📥 <b>Support Inbox</b>", "No messages yet.\n<i>Abhi koi message nahi hai.</i>"), kb([[("⬅️ Back", "adm:main")]]))
-    parts = ["📥 <b>Support Inbox</b> — latest 15"]
-    buttons = []
-    for r in rows:
-        tag = "✅" if r["status"] == "replied" else "🆕"
-        parts.append(
-            box(
-                f"{tag} #{r['id']} — {escape(r['name'] or '-')} (@{r['username'] or '-'})",
-                content_preview(r["content"]) or "(no text)",
-            )
-        )
-        if r["status"] != "replied":
-            buttons.append([(f"↩️ Reply #{r['id']}", f"sup:reply:{r['user_id']}:{r['id']}")])
-    buttons.append([("⬅️ Back", "adm:main")])
-    await show(c.message, sections(*parts), kb(buttons))
-    await c.answer()
 
 
 @router.callback_query(F.data.startswith("adm:edit:"))
@@ -1455,7 +1338,6 @@ async def main():
             BotCommand(command="help", description=style("Guide")),
             BotCommand(command="settings", description=style("Channel settings")),
             BotCommand(command="accept_all", description=style("Accept all pending requests")),
-            BotCommand(command="support", description=style("Contact bot owner")),
             BotCommand(command="cancel", description=style("Cancel")),
         ]
     )
