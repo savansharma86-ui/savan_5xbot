@@ -32,6 +32,7 @@ from aiogram.types import (
     KeyboardButton,
     LinkPreviewOptions,
     Message,
+    ReactionTypeEmoji,
     ReplyKeyboardMarkup,
 )
 from dotenv import load_dotenv
@@ -231,6 +232,7 @@ async def init_db():
             chat_id INTEGER, user_id INTEGER, owner_id INTEGER,
             status TEXT DEFAULT 'pending',
             created_at INTEGER,
+            dm_chat_id INTEGER, dm_msg_id INTEGER,
             PRIMARY KEY(chat_id, user_id)
         );
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
@@ -240,6 +242,8 @@ async def init_db():
     for stmt in (
         "ALTER TABLE owners ADD COLUMN mode_confirmed INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN last_seen INTEGER",
+        "ALTER TABLE requests ADD COLUMN dm_chat_id INTEGER",
+        "ALTER TABLE requests ADD COLUMN dm_msg_id INTEGER",
     ):
         with suppress(Exception):
             await db.execute(stmt)
@@ -910,17 +914,38 @@ async def cb_approve_run(c: CallbackQuery, bot: Bot):
 # ----------------------------------------------------------------------------
 # Join requests - the DM goes out FIRST, before any database work
 # ----------------------------------------------------------------------------
-async def record_request(chat_id, user, owner_id):
+async def record_request(chat_id, user, owner_id, dm_chat_id=None, dm_msg_id=None):
     await upsert_user(user)
     await run(
-        "INSERT OR REPLACE INTO requests(chat_id,user_id,owner_id,status,created_at) VALUES(?,?,?,'pending',?)",
-        (chat_id, user.id, owner_id, int(time.time())),
+        "INSERT OR REPLACE INTO requests(chat_id,user_id,owner_id,status,created_at,dm_chat_id,dm_msg_id) "
+        "VALUES(?,?,?,'pending',?,?,?)",
+        (chat_id, user.id, owner_id, int(time.time()), dm_chat_id, dm_msg_id),
     )
 
 
-def approved_text(a_title: str) -> str:
+async def notify_approved(bot: Bot, a_id, user_id, a_title, a_link=None, fallback_target=None):
+    """Turns the original 'request received' DM into the approval message in place."""
+    row = await one("SELECT dm_chat_id, dm_msg_id FROM requests WHERE chat_id=? AND user_id=?", (a_id, user_id))
+    text = approved_text(a_title, a_link)
+    if row and row["dm_msg_id"]:
+        with suppress(TelegramAPIError):
+            await bot.edit_message_text(text, chat_id=row["dm_chat_id"], message_id=row["dm_msg_id"])
+            return
+        with suppress(TelegramAPIError):
+            await bot.edit_message_caption(chat_id=row["dm_chat_id"], message_id=row["dm_msg_id"], caption=text)
+            return
+        with suppress(TelegramAPIError):
+            await bot.delete_message(row["dm_chat_id"], row["dm_msg_id"])
+    dest = (row["dm_chat_id"] if row else None) or fallback_target
+    if dest:
+        with suppress(TelegramAPIError):
+            await bot.send_message(dest, text)
+
+
+def approved_text(a_title: str, a_link: str = None) -> str:
+    name = f'<a href="{escape(a_link)}">{escape(a_title)}</a>' if a_link else escape(a_title)
     return (
-        f"🎉 <b>You are approved in {escape(a_title)}!</b>\n"
+        f"🎉 <b>You are approved in {name}!</b>\n"
         f"<i>Aap {escape(a_title)} me approve ho gaye ho.</i>"
     )
 
@@ -937,25 +962,41 @@ async def on_join_request(req: ChatJoinRequest, bot: Bot):
     if o["a_id"] == chat_id:
         gate_link = (o["b_link"] if o["b_id"] else None) or (await get_setting("default_b_link", "")) or None
         auto = bool(o["b_id"] and o["mode"] == "chain" and o["mode_confirmed"])
+        already_in_b = False
+        if auto:
+            with suppress(TelegramAPIError):
+                mem = await bot.get_chat_member(o["b_id"], user.id)
+                already_in_b = mem.status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR)
         data = parse_content(o["welcome"], legacy_escape=True) or {"t": "text", "c": default_welcome(auto, bool(gate_link))}
         markup = None
         if gate_link:
-            rows = [[InlineKeyboardButton(text="📣 Open channel & send request", url=gate_link)]]
-            if o["b_id"] and auto:
-                rows.append([InlineKeyboardButton(text="✅ Done — I already joined", callback_data=f"chk:{chat_id}")])
+            if auto and already_in_b:
+                # Already a member of B -> no new join-request event will ever fire for them,
+                # so they confirm with one tap instead of waiting forever.
+                rows = [
+                    [InlineKeyboardButton(text="📣 Open channel", url=gate_link)],
+                    [InlineKeyboardButton(text="✅ Done — I already joined", callback_data=f"chk:{chat_id}")],
+                ]
+            else:
+                # Not a member yet -> sending the join request alone is enough; it auto-approves,
+                # no button to tap. (Auto mode: approval happens the instant they request B.)
+                rows = [[InlineKeyboardButton(text="📣 Open channel & send request", url=gate_link)]]
             markup = InlineKeyboardMarkup(inline_keyboard=rows)
         sent = False
+        dm_chat_id = dm_msg_id = None
         for dest in dict.fromkeys([target, user.id]):
             try:
-                await send_content(bot, dest, data, markup, name=user.first_name or "friend", preview_url=gate_link)
+                msg = await send_content(bot, dest, data, markup, name=user.first_name or "friend", preview_url=gate_link)
                 sent = True
+                if msg is not None:
+                    dm_chat_id, dm_msg_id = msg.chat.id, msg.message_id
                 logging.info("DM sent to %s for request in chat %s", user.id, chat_id)
                 break
             except TelegramAPIError as e:
                 logging.warning("DM to %s (via %s) failed: %s", user.id, dest, e)
         if not sent:
             logging.warning("Could not DM user %s. Is the bot admin with Invite Users in chat %s?", user.id, chat_id)
-        await record_request(chat_id, user, o["user_id"])
+        await record_request(chat_id, user, o["user_id"], dm_chat_id, dm_msg_id)
         return
 
     await record_request(chat_id, user, o["user_id"])
@@ -965,8 +1006,7 @@ async def on_join_request(req: ChatJoinRequest, bot: Bot):
             good = await approve_one(bot, o["a_id"], user.id)
             await run("UPDATE requests SET status=? WHERE chat_id=? AND user_id=?", ("approved" if good else "failed", o["a_id"], user.id))
             if good:
-                with suppress(TelegramAPIError):
-                    await bot.send_message(target, approved_text(o["a_title"] or "the channel"))
+                await notify_approved(bot, o["a_id"], user.id, o["a_title"] or "the channel", o["a_link"], fallback_target=target)
 
 
 @router.callback_query(F.data.startswith("chk:"))
@@ -998,8 +1038,17 @@ async def cb_check_join(c: CallbackQuery, bot: Bot):
             ("approved" if good else "failed", a_id, user_id),
         )
         if good:
+            text = approved_text(o["a_title"] or "the channel", o["a_link"])
             with suppress(TelegramAPIError):
-                await c.message.answer(approved_text(o["a_title"] or "the channel"))
+                await c.message.edit_text(text)
+                await c.answer("Approved! ✅")
+                return
+            with suppress(TelegramAPIError):
+                await c.message.edit_caption(caption=text)
+                await c.answer("Approved! ✅")
+                return
+            with suppress(TelegramAPIError):
+                await c.message.answer(text)
             await c.answer("Approved! ✅")
         else:
             await c.answer("Could not approve — your request may have expired.", show_alert=True)
@@ -1020,24 +1069,36 @@ async def cb_check_join(c: CallbackQuery, bot: Bot):
         await c.answer("Not a member — request declined.", show_alert=True)
 
 
-@router.channel_post(F.text)
+LIKE_EMOJI = os.getenv("LIKE_EMOJI", "👍")
+
+
+@router.channel_post()
 async def on_channel_post(m: Message, bot: Bot):
-    cmd = m.text.strip().split()[0].lower().split("@")[0]
-    if cmd not in ("/accept_all", "/approve_all"):
-        return
-    o = await one("SELECT * FROM owners WHERE a_id=? OR b_id=?", (m.chat.id, m.chat.id))
-    if not o:
+    # /accept_all posted straight in the channel - only meaningful for channels connected to the bot
+    if m.text:
+        cmd = m.text.strip().split()[0].lower().split("@")[0]
+        if cmd in ("/accept_all", "/approve_all"):
+            o = await one("SELECT * FROM owners WHERE a_id=? OR b_id=?", (m.chat.id, m.chat.id))
+            if o:
+                with suppress(TelegramAPIError):
+                    await bot.delete_message(m.chat.id, m.message_id)
+                n = (await one("SELECT COUNT(*) n FROM requests WHERE chat_id=? AND status='pending'", (m.chat.id,)))["n"]
+                with suppress(TelegramAPIError):
+                    await bot.send_message(
+                        o["user_id"],
+                        f"⏳ /accept_all received in <b>{escape(m.chat.title or str(m.chat.id))}</b>.\n"
+                        f"Approving {n} pending requests...\n<i>{n} pending requests approve ho rahi hain...</i>",
+                    )
+                asyncio.create_task(run_approve_all(bot, [m.chat.id], o["user_id"]))
+            return
+
+    # Auto-like every other post - skip stickers only. Bots only ever receive channel_post
+    # updates from channels where they've been made admin, so no extra check is needed here:
+    # add the bot as admin anywhere and it starts liking posts in that channel automatically.
+    if m.sticker:
         return
     with suppress(TelegramAPIError):
-        await bot.delete_message(m.chat.id, m.message_id)
-    n = (await one("SELECT COUNT(*) n FROM requests WHERE chat_id=? AND status='pending'", (m.chat.id,)))["n"]
-    with suppress(TelegramAPIError):
-        await bot.send_message(
-            o["user_id"],
-            f"⏳ /accept_all received in <b>{escape(m.chat.title or str(m.chat.id))}</b>.\n"
-            f"Approving {n} pending requests...\n<i>{n} pending requests approve ho rahi hain...</i>",
-        )
-    asyncio.create_task(run_approve_all(bot, [m.chat.id], o["user_id"]))
+        await bot.set_message_reaction(m.chat.id, m.message_id, reaction=[ReactionTypeEmoji(emoji=LIKE_EMOJI)])
 
 
 # ----------------------------------------------------------------------------
