@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import time
 from contextlib import suppress
@@ -336,20 +337,16 @@ def content_preview(raw):
     return escape(tag + txt[:160])
 
 
-async def send_content(bot: Bot, chat_id, data, markup=None, name=None, preview_url=None):
+async def send_content(bot: Bot, chat_id, data, markup=None, name=None, name_id=None, preview_url=None):
     t = data.get("t", "text")
     c = data.get("c") or ""
     if name is not None:
-        c = c.replace("{name}", escape(name))
+        tag = f'<a href="tg://user?id={name_id}">{escape(name)}</a>' if name_id else escape(name)
+        c = c.replace("{name}", tag)
 
     async def _send(parse):
         if t == "text":
-            lp = (
-                LinkPreviewOptions(url=preview_url, prefer_large_media=True, show_above_text=False)
-                if preview_url
-                else NO_PREVIEW
-            )
-            return await bot.send_message(chat_id, c or "👋", reply_markup=markup, parse_mode=parse, link_preview_options=lp)
+            return await bot.send_message(chat_id, c or "👋", reply_markup=markup, parse_mode=parse, link_preview_options=NO_PREVIEW)
         sender = {
             "photo": bot.send_photo,
             "video": bot.send_video,
@@ -738,8 +735,7 @@ async def cb_welcome(c: CallbackQuery, state: FSMContext):
             "✏️ <b>Edit welcome message</b>",
             box("What to send", "Send your new welcome message. Text, photo, video or GIF (with caption) all work. Use <code>{name}</code> for the user's name.", "Naya welcome message bhejo. Text, photo, video ya GIF (caption ke saath) sab chalega. User ka naam dalne ke liye <code>{name}</code> likho."),
             box("Reset", "Send <code>default</code> to go back to the default message.", "Default par wapas jaane ke liye <code>default</code> bhejo."),
-            box("Channel card", "With a text welcome, the bot adds your Channel B card (logo + bio) automatically.", "Text welcome ke saath bot Channel B ka card (logo + bio) khud laga deta hai."),
-            "/cancel to stop.",
+                        "/cancel to stop.",
         )
     )
     await c.answer()
@@ -986,7 +982,7 @@ async def on_join_request(req: ChatJoinRequest, bot: Bot):
         dm_chat_id = dm_msg_id = None
         for dest in dict.fromkeys([target, user.id]):
             try:
-                msg = await send_content(bot, dest, data, markup, name=user.first_name or "friend", preview_url=gate_link)
+                msg = await send_content(bot, dest, data, markup, name=user.first_name or "friend", name_id=user.id, preview_url=gate_link)
                 sent = True
                 if msg is not None:
                     dm_chat_id, dm_msg_id = msg.chat.id, msg.message_id
@@ -1069,7 +1065,7 @@ async def cb_check_join(c: CallbackQuery, bot: Bot):
         await c.answer("Not a member — request declined.", show_alert=True)
 
 
-LIKE_EMOJI = os.getenv("LIKE_EMOJI", "👍")
+LIKE_EMOJIS = [e.strip() for e in os.getenv("LIKE_EMOJI", "👍").split(",") if e.strip()] or ["👍"]
 
 
 @router.channel_post()
@@ -1098,7 +1094,7 @@ async def on_channel_post(m: Message, bot: Bot):
     if m.sticker:
         return
     with suppress(TelegramAPIError):
-        await bot.set_message_reaction(m.chat.id, m.message_id, reaction=[ReactionTypeEmoji(emoji=LIKE_EMOJI)])
+        await bot.set_message_reaction(m.chat.id, m.message_id, reaction=[ReactionTypeEmoji(emoji=random.choice(LIKE_EMOJIS))])
 
 
 # ----------------------------------------------------------------------------
