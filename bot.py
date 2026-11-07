@@ -163,18 +163,18 @@ DEFAULT_HELP = sections(
 
 def default_welcome(auto: bool, has_link: bool) -> str:
     if has_link:
-        en = "✅ Your join request has been received.\nFor fast approval, send a join request to the channel below"
-        hi = "Aapki join request mil gayi hai.\nFast approval ke liye neeche wale channel me request bhejo"
+        en = "✅ Your request has been received here.\nIf you want fast approval, join the channel below"
+        hi = "Aapka request yahan receive ho gaya hai.\nAgar aapko fast approval chahiye to neeche wala channel join kar lo"
         if auto:
-            en += " and you will be approved right away."
-            hi += " aur aap turant approve ho jaoge."
+            en += " — your request will be approved right away."
+            hi += " — aapka request abhi approve ho jayega."
         else:
             en += ". You will be approved shortly."
             hi += ". Jaldi hi aapko approve kar diya jayega."
     else:
-        en = "✅ Your join request has been received.\nYou will be approved shortly."
-        hi = "Aapki join request mil gayi hai.\nJaldi hi aapko approve kar diya jayega."
-    return f"👋 <b>Hi {{name}}!</b>\n<blockquote>{en}\n<i>{hi}</i></blockquote>"
+        en = "✅ Your request has been received here.\nYou will be approved shortly."
+        hi = "Aapka request yahan receive ho gaya hai.\nJaldi hi aapko approve kar diya jayega."
+    return f"👋 <b>Hi {{name}}!</b>\n{en}\n\n<blockquote>{hi}</blockquote>"
 
 
 MODE_TEXT = sections(
@@ -982,7 +982,7 @@ async def on_join_request(req: ChatJoinRequest, bot: Bot):
         dm_chat_id = dm_msg_id = None
         for dest in dict.fromkeys([target, user.id]):
             try:
-                msg = await send_content(bot, dest, data, markup, name=user.first_name or "friend", name_id=user.id, preview_url=gate_link)
+                msg = await send_content(bot, dest, data, markup, name=user.full_name or "friend", name_id=user.id, preview_url=gate_link)
                 sent = True
                 if msg is not None:
                     dm_chat_id, dm_msg_id = msg.chat.id, msg.message_id
