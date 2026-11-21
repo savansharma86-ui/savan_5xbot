@@ -237,6 +237,15 @@ async def init_db():
             PRIMARY KEY(chat_id, user_id)
         );
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS channels(
+            channel_id INTEGER PRIMARY KEY,
+            owner_id INTEGER, title TEXT, link TEXT,
+            created_at INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS leaves(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id INTEGER, user_id INTEGER, left_at INTEGER
+        );
         """
     )
     await db.commit()
@@ -283,6 +292,47 @@ async def upsert_user(u):
 async def touch_user(user_id):
     with suppress(Exception):
         await run("UPDATE users SET last_seen=? WHERE user_id=?", (int(time.time()), user_id))
+
+
+async def register_channel(channel_id, owner_id, title, link):
+    await run(
+        "INSERT INTO channels(channel_id,owner_id,title,link,created_at) VALUES(?,?,?,?,?) "
+        "ON CONFLICT(channel_id) DO UPDATE SET owner_id=excluded.owner_id, title=excluded.title, link=excluded.link",
+        (channel_id, owner_id, title, link, int(time.time())),
+    )
+
+
+async def get_channel_owner(channel_id):
+    """Checks both systems: an owner's registered A/B pair, and the simple 'just admin' channels table."""
+    o = await one("SELECT * FROM owners WHERE a_id=? OR b_id=?", (channel_id, channel_id))
+    if o:
+        return "pair", o
+    c = await one("SELECT * FROM channels WHERE channel_id=?", (channel_id,))
+    if c:
+        return "simple", c
+    return None, None
+
+
+async def leaves_count(chat_ids, since=None):
+    if not chat_ids:
+        return 0
+    marks = ",".join("?" * len(chat_ids))
+    args = list(chat_ids)
+    extra = ""
+    if since:
+        extra = " AND left_at >= ?"
+        args.append(since)
+    r = await one(f"SELECT COUNT(*) n FROM leaves WHERE channel_id IN ({marks}){extra}", args)
+    return r["n"] or 0
+
+
+async def owner_all_channel_ids(owner_id):
+    o = await one("SELECT a_id, b_id FROM owners WHERE user_id=?", (owner_id,))
+    ids = [o[k] for k in ("a_id", "b_id")] if o else []
+    ids = [i for i in ids if i]
+    extra = await many("SELECT channel_id FROM channels WHERE owner_id=?", (owner_id,))
+    ids += [r["channel_id"] for r in extra]
+    return ids
 
 
 async def get_owner(uid):
@@ -469,6 +519,13 @@ class ChannelBroadcast(StatesGroup):
     confirm = State()
 
 
+class NewPost(StatesGroup):
+    choose_channel = State()
+    waiting_content = State()
+    waiting_buttons = State()
+    confirm = State()
+
+
 # ----------------------------------------------------------------------------
 # Commands
 # ----------------------------------------------------------------------------
@@ -589,26 +646,50 @@ async def cb_help(c: CallbackQuery, bot: Bot):
 # ----------------------------------------------------------------------------
 async def status_view(uid):
     o = await get_owner(uid)
-    if not o["a_id"] and not o["b_id"]:
+    extra = await many("SELECT channel_id, title FROM channels WHERE owner_id=?", (uid,))
+    if not o["a_id"] and not o["b_id"] and not extra:
         return (
-            sections("📊 <b>My Status</b>", box("No channel yet", "Connect a channel in ⚙️ Settings first.", "Pehle Settings me channel connect karo.")),
+            sections("📊 <b>My Status</b>", box("No channel yet", "Connect a channel in ⚙️ Settings, or just add the bot as admin anywhere.", "Settings me channel connect karo, ya bot ko kahin bhi admin bana do.")),
             kb([[("⚙️ Go to Settings", "s:main")]]),
         )
+    cutoff = int(time.time()) - 30 * DAY
     parts = ["📊 <b>My Status</b>"]
     for w in ("a", "b"):
         if o[f"{w}_id"]:
             r = await one(
                 "SELECT COUNT(*) t, SUM(status='approved') a, SUM(status='pending') p, "
                 "SUM(status='approved' AND created_at >= ?) m FROM requests WHERE chat_id=?",
-                (int(time.time()) - 30 * DAY, o[f"{w}_id"]),
+                (cutoff, o[f"{w}_id"]),
             )
+            left = await leaves_count([o[f"{w}_id"]])
+            left_m = await leaves_count([o[f"{w}_id"]], cutoff)
+            net = (r["a"] or 0) - left
             parts.append(
                 box(
                     f"Channel {w.upper()} — {escape(o[f'{w}_title'])}",
-                    f"Total requests: {r['t'] or 0}\n✅ Approved (members added): {r['a'] or 0}\n"
-                    f"📅 Approved this month: {r['m'] or 0}\n⏳ Pending: {r['p'] or 0}",
+                    f"Total requests: {r['t'] or 0}\n✅ Joined (approved): {r['a'] or 0}\n"
+                    f"📅 Joined this month: {r['m'] or 0}\n⏳ Pending: {r['p'] or 0}\n"
+                    f"🚪 Left: {left} (this month: {left_m})\n👥 Net members: {net}",
                 )
             )
+    if extra:
+        ids = [r["channel_id"] for r in extra]
+        marks = ",".join("?" * len(ids))
+        r = await one(
+            f"SELECT COUNT(*) t, SUM(status='approved') a, SUM(status='pending') p "
+            f"FROM requests WHERE chat_id IN ({marks})",
+            ids,
+        )
+        names = ", ".join(escape(x["title"] or str(x["channel_id"])) for x in extra)
+        left = await leaves_count(ids)
+        net = (r["a"] or 0) - left
+        parts.append(
+            box(
+                f"Other channels ({len(extra)}) — just admin, no pairing",
+                f"{names}\nTotal requests: {r['t'] or 0}\n✅ Joined: {r['a'] or 0}\n⏳ Pending: {r['p'] or 0}\n"
+                f"🚪 Left: {left}\n👥 Net members: {net}",
+            )
+        )
     return sections(*parts), kb([[("✅ Accept all", "s:approve"), ("⚙️ Settings", "s:main")]])
 
 
@@ -836,8 +917,10 @@ async def cb_stats(c: CallbackQuery):
 # ----------------------------------------------------------------------------
 async def approve_all_view(uid):
     o = await get_owner(uid)
-    if not o["a_id"] and not o["b_id"]:
-        return bi("❌ Set your channels first in /settings.", "Pehle /settings me channel set karo."), None
+    extra_ids = await many("SELECT channel_id FROM channels WHERE owner_id=?", (uid,))
+    extra_ids = [r["channel_id"] for r in extra_ids]
+    if not o["a_id"] and not o["b_id"] and not extra_ids:
+        return bi("❌ Set a channel in /settings, or add the bot as admin anywhere.", "Pehle /settings me channel set karo, ya bot ko kahin bhi admin bana do."), None
     counts = {}
     for w in ("a", "b"):
         if o[f"{w}_id"]:
@@ -850,6 +933,12 @@ async def approve_all_view(uid):
         rows.append([(f"✅ Approve B ({counts['b']})", "aa:b")])
     if len(counts) == 2:
         rows.append([("✅ Approve Both", "aa:both")])
+    if extra_ids:
+        marks = ",".join("?" * len(extra_ids))
+        n = (await one(f"SELECT COUNT(*) n FROM requests WHERE status='pending' AND chat_id IN ({marks})", extra_ids))["n"]
+        rows.append([(f"✅ Approve other channels ({n})", "aa:extra")])
+    if (counts or extra_ids) and len(counts) + bool(extra_ids) > 1:
+        rows.append([("✅ Approve Everything", "aa:all")])
     rows.append([("❌ Close", "home")])
     text = sections(
         "✅ <b>Accept all pending requests</b>",
@@ -896,10 +985,13 @@ async def cb_approve_run(c: CallbackQuery, bot: Bot):
     which = c.data.split(":")[1]
     o = await get_owner(c.from_user.id)
     ids = []
-    if which in ("a", "both") and o["a_id"]:
+    if which in ("a", "both", "all") and o["a_id"]:
         ids.append(o["a_id"])
-    if which in ("b", "both") and o["b_id"]:
+    if which in ("b", "both", "all") and o["b_id"]:
         ids.append(o["b_id"])
+    if which in ("extra", "all"):
+        extra = await many("SELECT channel_id FROM channels WHERE owner_id=?", (c.from_user.id,))
+        ids += [r["channel_id"] for r in extra]
     if not ids:
         return await c.answer("Nothing to approve", show_alert=True)
     asyncio.create_task(run_approve_all(bot, ids, c.from_user.id))
@@ -946,14 +1038,104 @@ def approved_text(a_title: str, a_link: str = None) -> str:
     )
 
 
+LEFT_STATUSES = {"left", "kicked"}
+
+
+@router.chat_member()
+async def on_member_update(event, bot: Bot):
+    """Logs a leave every time a member's status drops out of the channel - for the Left count in stats."""
+    member = event.new_chat_member
+    if member.user.is_bot:
+        return
+    kind, o = await get_channel_owner(event.chat.id)
+    if kind is None:
+        return
+    was_in = event.old_chat_member.status not in LEFT_STATUSES
+    now_out = member.status in LEFT_STATUSES
+    if was_in and now_out:
+        await run(
+            "INSERT INTO leaves(channel_id,user_id,left_at) VALUES(?,?,?)",
+            (event.chat.id, member.user.id, int(time.time())),
+        )
+
+
+@router.my_chat_member()
+async def on_bot_promoted(event, bot: Bot):
+    chat = event.chat
+    if chat.type not in ("channel", "supergroup", "group"):
+        return
+    old_admin = event.old_chat_member.status == ChatMemberStatus.ADMINISTRATOR
+    new_admin = event.new_chat_member.status == ChatMemberStatus.ADMINISTRATOR
+    if old_admin or not new_admin:
+        return  # only fires once, the moment the bot is freshly promoted
+    actor = event.from_user
+    if not actor:
+        return
+    already = await one("SELECT 1 FROM owners WHERE a_id=? OR b_id=?", (chat.id, chat.id))
+    if already:
+        return  # this chat is already set up as a Channel A/B pair - leave it alone
+    await get_owner(actor.id)  # requires the actor to have /start'd the bot before
+    link = None
+    if getattr(event.new_chat_member, "can_invite_users", False):
+        with suppress(TelegramAPIError):
+            invite = await bot.create_chat_invite_link(chat.id, name="JoinGate", creates_join_request=True)
+            link = invite.invite_link
+    await register_channel(chat.id, actor.id, chat.title or str(chat.id), link)
+    with suppress(TelegramAPIError):
+        parts = [
+            f"✅ <b>Added as admin in {escape(chat.title or str(chat.id))}</b>",
+            box(
+                "What happens now",
+                "Every join request here gets an instant DM with your default gate link, and you approve with /accept_all - no extra setup needed.",
+                "Yahan har join request ko turant DM milega aapke default gate link ke saath, aur aap /accept_all se approve karoge - kuch aur set karne ki zarurat nahi.",
+            ),
+        ]
+        if link:
+            parts.append(box("Share this link", link))
+        else:
+            parts.append(
+                box(
+                    "One more step",
+                    "Give the bot the Invite Users permission so it can create a join-request link for this channel.",
+                    "Bot ko Invite Users permission do taaki wo is channel ke liye join-request link bana sake.",
+                )
+            )
+        await bot.send_message(actor.id, sections(*parts))
+
+
 @router.chat_join_request()
 async def on_join_request(req: ChatJoinRequest, bot: Bot):
     chat_id = req.chat.id
     user = req.from_user
-    o = await one("SELECT * FROM owners WHERE a_id=? OR b_id=?", (chat_id, chat_id))
-    if not o:
+    kind, o = await get_channel_owner(chat_id)
+    if kind is None:
         return
     target = req.user_chat_id or user.id
+
+    if kind == "simple":
+        # Just-admin channel: no A/B pair configured - DM the default gate link and leave it
+        # on manual approve; the owner approves with /accept_all (in the bot or in the channel).
+        gate_link = (await get_setting("default_b_link", "")) or None
+        owner_row = await get_owner(o["owner_id"])
+        data = parse_content(owner_row["welcome"], legacy_escape=True) or {"t": "text", "c": default_welcome(False, bool(gate_link))}
+        markup = None
+        if gate_link:
+            markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📣 Open channel & send request", url=gate_link)]])
+        sent = False
+        dm_chat_id = dm_msg_id = None
+        for dest in dict.fromkeys([target, user.id]):
+            try:
+                msg = await send_content(bot, dest, data, markup, name=user.full_name or "friend", name_id=user.id, preview_url=gate_link)
+                sent = True
+                if msg is not None:
+                    dm_chat_id, dm_msg_id = msg.chat.id, msg.message_id
+                break
+            except TelegramAPIError as e:
+                logging.warning("DM to %s (via %s) failed: %s", user.id, dest, e)
+        if not sent:
+            logging.warning("Could not DM user %s in channel %s.", user.id, chat_id)
+        await record_request(chat_id, user, o["owner_id"], dm_chat_id, dm_msg_id)
+        return
 
     if o["a_id"] == chat_id:
         gate_link = (o["b_link"] if o["b_id"] else None) or (await get_setting("default_b_link", "")) or None
@@ -1074,18 +1256,19 @@ async def on_channel_post(m: Message, bot: Bot):
     if m.text:
         cmd = m.text.strip().split()[0].lower().split("@")[0]
         if cmd in ("/accept_all", "/approve_all"):
-            o = await one("SELECT * FROM owners WHERE a_id=? OR b_id=?", (m.chat.id, m.chat.id))
+            kind, o = await get_channel_owner(m.chat.id)
             if o:
+                owner_id = o["user_id"] if kind == "pair" else o["owner_id"]
                 with suppress(TelegramAPIError):
                     await bot.delete_message(m.chat.id, m.message_id)
                 n = (await one("SELECT COUNT(*) n FROM requests WHERE chat_id=? AND status='pending'", (m.chat.id,)))["n"]
                 with suppress(TelegramAPIError):
                     await bot.send_message(
-                        o["user_id"],
+                        owner_id,
                         f"⏳ /accept_all received in <b>{escape(m.chat.title or str(m.chat.id))}</b>.\n"
                         f"Approving {n} pending requests...\n<i>{n} pending requests approve ho rahi hain...</i>",
                     )
-                asyncio.create_task(run_approve_all(bot, [m.chat.id], o["user_id"]))
+                asyncio.create_task(run_approve_all(bot, [m.chat.id], owner_id))
             return
 
     # Auto-like every other post - skip stickers only. Bots only ever receive channel_post
@@ -1135,21 +1318,33 @@ async def adm_stats(c: CallbackQuery):
     u = await one("SELECT COUNT(*) n, SUM(banned) b FROM users")
     active = (await one("SELECT COUNT(*) n FROM users WHERE last_seen >= ?", (cutoff,)))["n"]
     ch = await one(
-        "SELECT (SELECT COUNT(*) FROM owners WHERE a_id IS NOT NULL) + (SELECT COUNT(*) FROM owners WHERE b_id IS NOT NULL) n"
+        "SELECT (SELECT COUNT(*) FROM owners WHERE a_id IS NOT NULL) + (SELECT COUNT(*) FROM owners WHERE b_id IS NOT NULL) "
+        "+ (SELECT COUNT(*) FROM channels) n"
     )
-    owners = (await one("SELECT COUNT(*) n FROM owners WHERE a_id IS NOT NULL OR b_id IS NOT NULL"))["n"]
+    extra_ch = (await one("SELECT COUNT(*) n FROM channels"))["n"]
+    owners = (
+        await one(
+            "SELECT COUNT(DISTINCT user_id) n FROM ("
+            "SELECT user_id FROM owners WHERE a_id IS NOT NULL OR b_id IS NOT NULL "
+            "UNION SELECT owner_id user_id FROM channels)"
+        )
+    )["n"]
     r = await one(
         "SELECT COUNT(*) n, SUM(status='approved') a, SUM(status='pending') p, "
         "SUM(status='approved' AND created_at >= ?) m FROM requests",
         (cutoff,),
     )
+    total_left = (await one("SELECT COUNT(*) n FROM leaves"))["n"]
+    left_m = (await one("SELECT COUNT(*) n FROM leaves WHERE left_at >= ?", (cutoff,)))["n"]
+    net = (r["a"] or 0) - total_left
     text = sections(
         "📊 <b>Bot Stats</b>",
         box("Bot users", f"Total: {u['n']}\n📅 Active last 30 days: {active}\n🚫 Banned: {u['b'] or 0}"),
-        box("Channels", f"Bot is admin in: {ch['n']}\nChannel owners: {owners}"),
+        box("Channels", f"Bot is admin in: {ch['n']} (incl. {extra_ch} just-admin)\nChannel owners: {owners}"),
         box(
-            "Members added (via requests)",
-            f"Total approved: {r['a'] or 0}\n📅 Approved last 30 days: {r['m'] or 0}\n⏳ Pending: {r['p'] or 0}\nAll requests: {r['n']}",
+            "Members (via requests)",
+            f"✅ Joined (approved): {r['a'] or 0}\n📅 Joined last 30 days: {r['m'] or 0}\n⏳ Pending: {r['p'] or 0}\n"
+            f"🚪 Left: {total_left} (last 30 days: {left_m})\n👥 Net members: {net}\nAll requests: {r['n']}",
         ),
     )
     await show(c.message, text, kb([[("👥 Per-owner breakdown", "adm:owners")], [("⬅️ Back", "adm:main")]]))
@@ -1161,24 +1356,32 @@ async def adm_owners(c: CallbackQuery):
     if not owner_only(c):
         return await c.answer("Owner only", show_alert=True)
     cutoff = int(time.time()) - 30 * DAY
-    rows = await many("SELECT user_id,a_id,a_title,b_id,b_title,mode,mode_confirmed FROM owners WHERE a_id IS NOT NULL OR b_id IS NOT NULL LIMIT 40")
+    pair_rows = await many("SELECT user_id,a_id,a_title,b_id,b_title FROM owners WHERE a_id IS NOT NULL OR b_id IS NOT NULL")
+    owner_ids = {r["user_id"] for r in pair_rows}
+    extra_rows = await many("SELECT DISTINCT owner_id FROM channels")
+    owner_ids |= {r["owner_id"] for r in extra_rows}
     parts = ["👥 <b>Channel owners</b> — members added via this bot (ban with /ban ID)"]
-    for r in rows:
-        ids = [r["a_id"], r["b_id"]]
+    for uid in list(owner_ids)[:40]:
+        pr = next((r for r in pair_rows if r["user_id"] == uid), None)
+        ids = [pr["a_id"], pr["b_id"]] if pr else []
+        extra_ch = await many("SELECT channel_id FROM channels WHERE owner_id=?", (uid,))
+        ids += [r["channel_id"] for r in extra_ch]
         ids = [i for i in ids if i]
+        if not ids:
+            continue
         marks = ",".join("?" * len(ids))
         agg = await one(
             f"SELECT SUM(status='approved') a, SUM(status='approved' AND created_at >= ?) m FROM requests WHERE chat_id IN ({marks})",
             (cutoff, *ids),
         )
-        parts.append(
-            box(
-                f"<code>{r['user_id']}</code>",
-                f"A: {escape(r['a_title'] or '-')}\nB: {escape(r['b_title'] or '-')}\n"
-                f"👥 Total members: {agg['a'] or 0} | 📅 This month: {agg['m'] or 0}",
-            )
-        )
-    if not rows:
+        lines = []
+        if pr:
+            lines.append(f"A: {escape(pr['a_title'] or '-')}\nB: {escape(pr['b_title'] or '-')}")
+        if extra_ch:
+            lines.append(f"+ {len(extra_ch)} other channel(s)")
+        lines.append(f"👥 Total members: {agg['a'] or 0} | 📅 This month: {agg['m'] or 0}")
+        parts.append(box(f"<code>{uid}</code>", "\n".join(lines)))
+    if len(parts) == 1:
         parts.append("No one yet.")
     await show(c.message, sections(*parts), kb([[("⬅️ Back", "adm:main")]]))
     await c.answer()
@@ -1314,7 +1517,9 @@ async def bc_confirm(c: CallbackQuery, state: FSMContext, bot: Bot):
 # ----------------------------------------------------------------------------
 async def all_admin_channels():
     rows = await many(
-        "SELECT a_id c FROM owners WHERE a_id IS NOT NULL UNION SELECT b_id c FROM owners WHERE b_id IS NOT NULL"
+        "SELECT a_id c FROM owners WHERE a_id IS NOT NULL "
+        "UNION SELECT b_id c FROM owners WHERE b_id IS NOT NULL "
+        "UNION SELECT channel_id c FROM channels"
     )
     return [r["c"] for r in rows]
 
@@ -1375,6 +1580,155 @@ async def cbc_confirm(c: CallbackQuery, state: FSMContext, bot: Bot):
 
 
 # ----------------------------------------------------------------------------
+# /newpost - build a post with custom link buttons and publish it to one of
+# the channel owner's own channels. Format:
+#   Proof - link1 && Pay - link2 && Store - link3
+#   Collab Store - link4
+# "&&" keeps buttons on the same row; a new line starts a new row.
+# ----------------------------------------------------------------------------
+async def owner_channels_titled(uid):
+    o = await get_owner(uid)
+    items = []
+    if o["a_id"]:
+        items.append((o["a_id"], o["a_title"] or str(o["a_id"])))
+    if o["b_id"]:
+        items.append((o["b_id"], o["b_title"] or str(o["b_id"])))
+    extra = await many("SELECT channel_id, title FROM channels WHERE owner_id=?", (uid,))
+    items += [(r["channel_id"], r["title"] or str(r["channel_id"])) for r in extra]
+    return items
+
+
+def parse_buttons(text):
+    """'Label - url && Label2 - url2' per row -> [[(label,url), ...], ...], or (None, error)."""
+    rows = []
+    for line in text.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        row = []
+        for seg in line.split("&&"):
+            seg = seg.strip()
+            if " - " not in seg:
+                return None, f"This part is missing ' - ' between the label and the link:\n{seg}"
+            label, url = (x.strip() for x in seg.split(" - ", 1))
+            if not label or not url:
+                return None, f"Empty label or link in:\n{seg}"
+            if url.startswith("t.me/") or url.startswith("www."):
+                url = "https://" + url
+            if not url.startswith(("http://", "https://", "tg://")):
+                return None, f"This link looks invalid (needs http/https):\n{seg}"
+            row.append((label, url))
+        if row:
+            rows.append(row)
+    if not rows:
+        return None, "No buttons found."
+    return rows, None
+
+
+def buttons_markup(rows):
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=l, url=u) for l, u in row] for row in rows])
+
+
+@router.message(Command("newpost"))
+async def cmd_newpost(m: Message, state: FSMContext):
+    await state.clear()
+    channels = await owner_channels_titled(m.from_user.id)
+    if not channels:
+        return await m.answer(
+            bi(
+                "❌ You have no channel yet. Connect one in /settings, or add the bot as admin anywhere.",
+                "Abhi aapka koi channel nahi hai. /settings me connect karo, ya bot ko kahin bhi admin bana do.",
+            )
+        )
+    if len(channels) == 1:
+        chat_id, title = channels[0]
+        await state.set_state(NewPost.waiting_content)
+        await state.update_data(chat_id=chat_id, title=title)
+        return await m.answer(
+            sections(
+                f"📝 <b>New post for {escape(title)}</b>",
+                box("Step 1", "Send the post now - text or a photo with a caption.", "Ab post bhejo - text ya caption wali photo."),
+                "/cancel to stop.",
+            )
+        )
+    await state.set_state(NewPost.choose_channel)
+    await m.answer(
+        "📝 <b>New post</b> — which channel?",
+        reply_markup=kb([[(title, f"np:pick:{chat_id}")] for chat_id, title in channels]),
+    )
+
+
+@router.callback_query(NewPost.choose_channel, F.data.startswith("np:pick:"))
+async def np_pick(c: CallbackQuery, state: FSMContext):
+    chat_id = int(c.data.split(":")[2])
+    channels = await owner_channels_titled(c.from_user.id)
+    match = next((t for cid, t in channels if cid == chat_id), None)
+    if not match:
+        return await c.answer("Not your channel.", show_alert=True)
+    await state.set_state(NewPost.waiting_content)
+    await state.update_data(chat_id=chat_id, title=match)
+    await show(
+        c.message,
+        sections(
+            f"📝 <b>New post for {escape(match)}</b>",
+            box("Step 1", "Send the post now - text or a photo with a caption.", "Ab post bhejo - text ya caption wali photo."),
+            "/cancel to stop.",
+        ),
+    )
+    await c.answer()
+
+
+@router.message(NewPost.waiting_content)
+async def np_got_content(m: Message, state: FSMContext):
+    data = extract_content(m)
+    if not data or data.get("t") not in ("text", "photo"):
+        return await m.answer(bi("❌ Send text or a photo only.", "Sirf text ya photo bhejo."))
+    await state.update_data(content=data)
+    await state.set_state(NewPost.waiting_buttons)
+    await m.answer(
+        sections(
+            "🔗 <b>Step 2 — Buttons</b>",
+            box(
+                "Format",
+                "One row per line. Use && to put more than one button on the same row.",
+                "Har line ek row hai. Ek row me ek se zyada button ke liye && use karo.",
+            ),
+            "<code>Proof - https://t.me/proof && Pay - https://t.me/pay\nStore - https://t.me/store</code>",
+            "/cancel to stop.",
+        )
+    )
+
+
+@router.message(NewPost.waiting_buttons, F.text)
+async def np_got_buttons(m: Message, state: FSMContext, bot: Bot):
+    rows, err = parse_buttons(m.text)
+    if err:
+        return await m.answer(f"❌ {escape(err)}\n\nSend the buttons again, or /cancel.")
+    data = await state.get_data()
+    await state.update_data(rows=rows)
+    await state.set_state(NewPost.confirm)
+    await send_content(bot, m.chat.id, data["content"], buttons_markup(rows))
+    await m.answer(
+        f"👆 Preview for <b>{escape(data['title'])}</b>. Publish it?",
+        reply_markup=kb([[("✅ Publish", "np:go"), ("❌ Cancel", "np:cancel")]]),
+    )
+
+
+@router.callback_query(NewPost.confirm, F.data.in_({"np:go", "np:cancel"}))
+async def np_confirm(c: CallbackQuery, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    await state.clear()
+    if c.data == "np:cancel":
+        return await show(c.message, "❌ Post cancelled.")
+    try:
+        await send_content(bot, data["chat_id"], data["content"], buttons_markup(data["rows"]))
+        await show(c.message, f"✅ Published in <b>{escape(data['title'])}</b>!")
+    except TelegramAPIError as e:
+        await show(c.message, f"❌ Could not publish: {e}")
+    await c.answer()
+
+
+# ----------------------------------------------------------------------------
 # Entry point
 # ----------------------------------------------------------------------------
 async def main():
@@ -1395,6 +1749,7 @@ async def main():
             BotCommand(command="help", description=style("Guide")),
             BotCommand(command="settings", description=style("Channel settings")),
             BotCommand(command="accept_all", description=style("Accept all pending requests")),
+            BotCommand(command="newpost", description=style("Create a post with buttons")),
             BotCommand(command="cancel", description=style("Cancel")),
         ]
     )
